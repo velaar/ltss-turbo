@@ -436,145 +436,139 @@ class LTSS_DB(threading.Thread):
 
     def _bulk_insert_copy(self, rows: Iterable[Any]) -> None:
         """
-        Safer COPY implementation using CSV format with proper escaping.
-        
-        This method uses:
-        - CSV mode with TAB delimiter for reliable quoting
-        - NULL as \\N which PostgreSQL understands
-        - Proper JSON serialization with datetime handling
-        - Normalized booleans and numerics to avoid locale issues
+        Use PostgreSQL text format instead of CSV to avoid JSON escaping issues.
+        Text format is simpler and more predictable for complex data types.
         """
-        # Collect once to allow len() checks without exhausting an iterator
         rows = list(rows)
         if not rows:
             return
 
-        def _iso(dt: Optional[Any]) -> Optional[str]:
-            """Convert datetime to ISO format or return None."""
-            if not dt:
-                return None
+        def _format_value(val: Any, is_json: bool = False) -> str:
+            """Format a value for PostgreSQL text format."""
+            if val is None:
+                return "\\N"
+            
+            if is_json:
+                # For JSON columns, ensure proper JSON formatting
+                if isinstance(val, str):
+                    # If it's already a JSON string, validate and use it
+                    try:
+                        json.loads(val)  # Validate it's proper JSON
+                        # Escape special characters for text format
+                        return val.replace('\\', '\\\\').replace('\t', '\\t').replace('\n', '\\n').replace('\r', '\\r')
+                    except (json.JSONDecodeError, TypeError):
+                        # If not valid JSON, wrap in a JSON object
+                        return json.dumps({"_raw_value": str(val)}).replace('\\', '\\\\').replace('\t', '\\t').replace('\n', '\\n').replace('\r', '\\r')
+                else:
+                    # Convert to JSON and escape
+                    json_str = json.dumps(val, default=str, ensure_ascii=False, allow_nan=False)
+                    return json_str.replace('\\', '\\\\').replace('\t', '\\t').replace('\n', '\\n').replace('\r', '\\r')
+            else:
+                # For regular columns, just escape special characters
+                str_val = str(val)
+                return str_val.replace('\\', '\\\\').replace('\t', '\\t').replace('\n', '\\n').replace('\r', '\\r')
+
+        def _format_datetime(dt: Any) -> str:
+            """Format datetime for PostgreSQL."""
+            if dt is None:
+                return "\\N"
             try:
                 return dt.isoformat()
-            except Exception:
+            except:
                 return str(dt)
 
-        def _to_str_or_none(v: Optional[Any]) -> Optional[str]:
-            """Convert value to string or return None."""
-            if v is None:
-                return None
-            return str(v)
+        def _format_bool(val: bool) -> str:
+            """Format boolean for PostgreSQL."""
+            return "t" if val else "f"
 
-        def _to_bool_str(flag: Optional[bool]) -> str:
-            """Convert boolean to string."""
-            return "true" if bool(flag) else "false"
-
-        def _to_json_or_none(obj: Optional[Any]) -> Optional[str]:
-            """Convert object to JSON string, handling datetime, NaN/Inf values."""
-            if obj is None:
-                return None
-            
-            def _clean_value(x):
-                """Clean problematic values from data."""
-                try:
-                    # Handle datetime objects
-                    if hasattr(x, 'isoformat'):
-                        return x.isoformat()
-                    # Handle date objects  
-                    elif hasattr(x, 'strftime'):
-                        return x.strftime('%Y-%m-%d')
-                    # Handle float edge cases
-                    elif isinstance(x, float):
-                        if x != x:  # NaN
-                            return None
-                        if x == float("inf") or x == float("-inf"):
-                            return None
-                    return x
-                except Exception:
-                    return str(x) if x is not None else None
-
-            def _recurse_clean(val):
-                """Recursively clean nested data structures."""
-                if isinstance(val, dict):
-                    return {k: _recurse_clean(v) for k, v in val.items()}
-                if isinstance(val, (list, tuple)):
-                    return [_recurse_clean(v) for v in val]
-                return _clean_value(val)
-
-            cleaned = _recurse_clean(obj)
-            return json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"), allow_nan=False, default=str)
-
-        # Build the in-memory CSV/TSV
+        # Build text format data
         buffer = StringIO()
-        writer = csv.writer(
-            buffer,
-            delimiter="\t",
-            quoting=csv.QUOTE_MINIMAL,
-            escapechar="\\",
-            lineterminator="\n",
-        )
+        
+        for row in rows:
+            # Get attributes and convert to clean JSON
+            attrs = getattr(row, "attributes", None)
+            if attrs and isinstance(attrs, dict) and len(attrs) > 0:
+                # Clean the attributes dictionary
+                clean_attrs = {}
+                for k, v in attrs.items():
+                    # Ensure keys are strings
+                    clean_key = str(k) if k is not None else "null"
+                    # Handle various value types
+                    if v is None:
+                        clean_attrs[clean_key] = None
+                    elif isinstance(v, (list, tuple)):
+                        clean_attrs[clean_key] = list(v)  # Convert tuples to lists
+                    elif isinstance(v, set):
+                        clean_attrs[clean_key] = sorted(list(v))  # Convert sets to sorted lists
+                    elif hasattr(v, 'isoformat'):  # datetime
+                        clean_attrs[clean_key] = v.isoformat()
+                    elif hasattr(v, '__dict__') and not isinstance(v, (str, int, float, bool)):
+                        clean_attrs[clean_key] = str(v)  # Convert complex objects to strings
+                    else:
+                        clean_attrs[clean_key] = v
+                
+                attributes_json = json.dumps(clean_attrs, default=str, ensure_ascii=False, allow_nan=False)
+            else:
+                attributes_json = None
 
-        # Base column order
+            # Build the row data
+            row_data = [
+                _format_datetime(getattr(row, "time", None)),
+                _format_value(getattr(row, "entity_id", None)),
+                _format_value(getattr(row, "state", None)),
+                _format_value(attributes_json, is_json=True) if attributes_json else "\\N",
+                _format_value(getattr(row, "friendly_name", None)),
+                _format_value(getattr(row, "unit_of_measurement", None)),
+                _format_value(getattr(row, "device_class", None)),
+                _format_value(getattr(row, "icon", None)),
+                _format_value(getattr(row, "domain", None)),
+                _format_value(getattr(row, "state_numeric", None)),
+                _format_datetime(getattr(row, "last_changed", None)),
+                _format_datetime(getattr(row, "last_updated", None)),
+                _format_bool(getattr(row, "is_unavailable", False)),
+                _format_bool(getattr(row, "is_unknown", False)),
+            ]
+            
+            # Add location if enabled
+            if getattr(self, "enable_location", False):
+                row_data.append(_format_value(getattr(row, "location", None)))
+
+            # Join with tabs and add newline
+            buffer.write('\t'.join(row_data) + '\n')
+
+        buffer.seek(0)
+
+        # Use text format instead of CSV
+        conn = self._get_copy_connection()
         columns = [
-            "time",
-            "entity_id",
-            "state",
-            "attributes",
-            "friendly_name",
-            "unit_of_measurement",
-            "device_class",
-            "icon",
-            "domain",
-            "state_numeric",
-            "last_changed",
-            "last_updated",
-            "is_unavailable",
-            "is_unknown",
+            "time", "entity_id", "state", "attributes",
+            "friendly_name", "unit_of_measurement", "device_class", "icon",
+            "domain", "state_numeric", "last_changed", "last_updated",
+            "is_unavailable", "is_unknown"
         ]
         if getattr(self, "enable_location", False):
             columns.append("location")
 
-        # PostgreSQL NULL representation
-        NULL_VALUE = "\\N"
-
-        for row in rows:
-            # Build row data with proper NULL handling
-            payload = [
-                _iso(getattr(row, "time", None)) or NULL_VALUE,
-                _to_str_or_none(getattr(row, "entity_id", None)) or NULL_VALUE,
-                _to_str_or_none(getattr(row, "state", None)) or NULL_VALUE,
-                _to_json_or_none(getattr(row, "attributes", None)) or NULL_VALUE,
-                _to_str_or_none(getattr(row, "friendly_name", None)) or NULL_VALUE,
-                _to_str_or_none(getattr(row, "unit_of_measurement", None)) or NULL_VALUE,
-                _to_str_or_none(getattr(row, "device_class", None)) or NULL_VALUE,
-                _to_str_or_none(getattr(row, "icon", None)) or NULL_VALUE,
-                _to_str_or_none(getattr(row, "domain", None)) or NULL_VALUE,
-                _to_str_or_none(getattr(row, "state_numeric", None)) or NULL_VALUE,
-                _iso(getattr(row, "last_changed", None)) or NULL_VALUE,
-                _iso(getattr(row, "last_updated", None)) or NULL_VALUE,
-                _to_bool_str(getattr(row, "is_unavailable", False)),
-                _to_bool_str(getattr(row, "is_unknown", False)),
-            ]
-            if "location" in columns:
-                payload.append(_to_str_or_none(getattr(row, "location", None)) or NULL_VALUE)
-
-            writer.writerow(payload)
-
-        buffer.seek(0)
-
-        # Build COPY command using PostgreSQL CSV format with corrected syntax
-        conn = self._get_copy_connection()
         cols_sql = ", ".join(columns)
-        copy_sql = (
-            f"COPY {self.table_name} ({cols_sql}) "
-            f"FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', QUOTE E'\"', ESCAPE E'\\\\', NULL E'\\\\N')"
-        )
+        copy_sql = f"COPY {self.table_name} ({cols_sql}) FROM STDIN WITH (FORMAT text)"
 
         try:
             with conn.cursor() as cur:
                 cur.copy_expert(copy_sql, buffer)
             conn.commit()
-        except Exception:
-            # Rollback and drop the connection so a fresh one is used next time
+            
+        except Exception as e:
+            _LOGGER.error(f"COPY operation failed: {e}")
+            
+            # Debug output for text format
+            if "invalid input syntax for type json" in str(e) or "invalid input syntax" in str(e):
+                buffer.seek(0)
+                lines = buffer.read().split('\n')
+                _LOGGER.error(f"First few lines of failed COPY data (text format):")
+                for i, line in enumerate(lines[:3]):
+                    if line.strip():
+                        _LOGGER.error(f"Line {i+1}: {repr(line)}")  # Use repr to show exact characters
+            
             try:
                 conn.rollback()
             finally:

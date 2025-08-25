@@ -252,7 +252,7 @@ class BinaryRowEncoder:
         buffer.write(self._int32_format.pack(0))    # Flags
         buffer.write(self._int32_format.pack(0))    # Header extension
         
-        # Field definitions (column types in order) - location is now mandatory
+        # Field definitions (column types in order) 
         field_types = [
             'timestamptz',  # time
             'text',         # entity_id
@@ -747,7 +747,6 @@ class LTSS_DB(threading.Thread):
             self.table_name,
             enable_timescale=True,
             enable_compression=self.enable_compression,
-            enable_location=True,  # Always enabled now
             chunk_time_interval=self.chunk_time_interval,
             compression_after=self.compression_after,
             retention_days=self.retention_days
@@ -760,7 +759,7 @@ class LTSS_DB(threading.Thread):
         self.get_session = scoped_session(sessionmaker(bind=self.engine))
         
         _LOGGER.info(
-            "LTSS Turbo optimized connection initialized: table=%s, location=mandatory, compression=%s",
+            "LTSS Turbo optimized connection initialized: table=%s, compression=%s",
             self.table_name,
             "enabled" if self.enable_compression else "disabled"
         )

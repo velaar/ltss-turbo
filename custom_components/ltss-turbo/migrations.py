@@ -149,12 +149,13 @@ def _run_initial_setup(conn, engine: Engine, table_name: str,
         except Exception as e:
             _LOGGER.warning(f"Could not enable PostGIS: {e}")
     
-    # Create table if it doesn't exist
-    if not inspector.has_table(table_name):
-        _LOGGER.info(f"Creating table '{table_name}'...")
-        from .models import Base
-        Base.metadata.create_all(engine, tables=[Base.metadata.tables[table_name]])
-        
+        # Create table if it doesn't exist
+        if not inspector.has_table(table_name):
+            _LOGGER.info(f"Creating table '{table_name}'...")
+            from .models import Base
+            Base.metadata.create_all(engine, tables=[Base.metadata.tables[table_name]])
+        else:
+            _LOGGER.info(f"Table '{table_name}' already exists — skipping creation")
         # Convert to hypertable if TimescaleDB is available
         if enable_timescale and "timescaledb" in extensions:
             try:

@@ -47,7 +47,7 @@ from homeassistant.helpers.typing import ConfigType
 import homeassistant.util.dt as dt_util
 from homeassistant.helpers.json import JSONEncoder
 
-from .services import setup_services
+#from .services import setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -156,7 +156,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     
     # Set up services if database is ready
     if db_ready:
-        setup_services(hass, instance)
+        #setup_services(hass, instance)
         _LOGGER.info("LTSS Turbo services registered")
     
     return db_ready

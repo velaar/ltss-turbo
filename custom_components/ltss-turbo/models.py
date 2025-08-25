@@ -17,7 +17,12 @@ from sqlalchemy import (
 from sqlalchemy.schema import Index
 from sqlalchemy.dialects.postgresql import JSONB
 from geoalchemy2 import Geometry
-from sqlalchemy.orm import column_property, declarative_base
+from sqlalchemy.orm import (
+    column_property,
+    declarative_base,
+    mapped_column, 
+    Mapped        
+)
 
 # SQLAlchemy Schema
 Base = declarative_base()
@@ -290,9 +295,9 @@ def make_ltss_model(table_name: str = "ltss"):
                     is_unknown=is_unknown,
                     location=location,
                 )
-                
+
             except Exception as e:
                 _LOGGER.error(f"Error creating LTSS record from event: {e}", exc_info=True)
                 return None
-            
-
+    # hotfix for SQLAlchemy table caching issue
+    Base.metadata._remove_table(table_name, None)

@@ -43,10 +43,10 @@ def run_startup_migrations(engine: Engine, table_name: str = "ltss",
             conn = conn.execution_options(isolation_level="AUTOCOMMIT")
             
             # Ensure metadata table exists
-            _ensure_metadata_table(conn)
+            _ensure_metadata_table(conn, table_name)
             
             # Get current schema version
-            current_version = _get_schema_version(conn)
+            current_version = _get_schema_version(conn, table_name)
             
             if current_version is None:
                 # Fresh install - run initial setup
@@ -62,7 +62,7 @@ def run_startup_migrations(engine: Engine, table_name: str = "ltss",
                     _LOGGER.info(f"Running migration v{version}...")
                     try:
                         MIGRATIONS[version](conn, table_name, engine)
-                        _set_schema_version(conn, version)
+                        _set_schema_version(conn, table_name, version)
                         migrations_run += 1
                         current_version = version
                     except Exception as e:
@@ -86,33 +86,34 @@ def run_startup_migrations(engine: Engine, table_name: str = "ltss",
         return False
 
 
-def _ensure_metadata_table(conn):
-    """Create metadata table if it doesn't exist."""
-    conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS ltss_meta (
+def _ensure_metadata_table(conn, table_name: str):
+    """Create metadata table if it doesn't exist (per-table)."""
+    meta_table = f"{table_name}_meta"
+    conn.execute(text(f"""
+        CREATE TABLE IF NOT EXISTS {meta_table} (
             key VARCHAR(50) PRIMARY KEY,
             value TEXT NOT NULL,
             updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     """))
 
-
-def _get_schema_version(conn) -> Optional[int]:
+def _get_schema_version(conn, table_name: str) -> Optional[int]:
     """Get current schema version from metadata."""
+    meta_table = f"{table_name}_meta"
     try:
-        result = conn.execute(text("""
-            SELECT value FROM ltss_meta WHERE key = 'schema_version'
+        result = conn.execute(text(f"""
+            SELECT value FROM {meta_table} WHERE key = 'schema_version'
         """))
         row = result.fetchone()
         return int(row.value) if row else None
     except Exception:
         return None
 
-
-def _set_schema_version(conn, version: int):
+def _set_schema_version(conn, table_name: str, version: int):
     """Update schema version in metadata."""
-    conn.execute(text("""
-        INSERT INTO ltss_meta (key, value, updated_at)
+    meta_table = f"{table_name}_meta"
+    conn.execute(text(f"""
+        INSERT INTO {meta_table} (key, value, updated_at)
         VALUES ('schema_version', :version, NOW())
         ON CONFLICT (key) DO UPDATE 
         SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at

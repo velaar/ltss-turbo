@@ -75,7 +75,7 @@ DEFAULT_POLL_INTERVAL_MS = 100
 DEFAULT_COMPRESSION_AFTER = 7  # Compress chunks older than 7 days by default
 DEFAULT_POOL_SIZE = 5
 DEFAULT_MAX_OVERFLOW = 10
-DEFAULT_TABLE_NAME = "ltss-turbo"
+DEFAULT_TABLE_NAME = "ltss_turbo"
 
 CONFIG_SCHEMA = vol.Schema(
     {
@@ -386,7 +386,7 @@ class LTSS_DB(threading.Thread):
         # Convert events to LTSS records
         for i, event in enumerate(batch):
             try:
-                row = LTSS.from_event(event)
+                row = self.LTSS.from_event(event)
                 if row:
                     rows_data[valid_rows] = row
                     valid_rows += 1
@@ -440,7 +440,7 @@ class LTSS_DB(threading.Thread):
         for _ in batch:
             self.queue.task_done()
 
-    def _bulk_insert_copy(self, rows: List[LTSS]) -> None:
+    def _bulk_insert_copy(self, rows: List[Any]) -> None:
         """Use PostgreSQL COPY for efficient bulk insert with optimized formatting."""
         if not rows:
             return
@@ -469,12 +469,9 @@ class LTSS_DB(threading.Thread):
                 "true" if row.is_unknown else "false",
             ]
             
-            # Add location if enabled
-            if LTSS.location is not None:
-                if hasattr(row, 'location') and row.location:
-                    row_data.append(row.location)
-                else:
-                    row_data.append("\\N")
+            # Add location if enabled in config
+            if self.enable_location:
+                row_data.append(getattr(row, "location", None) or "\\N")
             
             writer.writerow(row_data)
         
@@ -492,7 +489,7 @@ class LTSS_DB(threading.Thread):
                     "is_unavailable", "is_unknown"
                 ]
                 
-                if LTSS.location is not None:
+                if self.enable_location:
                     columns.append("location")
                 
                 cursor.copy_from(

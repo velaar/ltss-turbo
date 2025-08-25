@@ -1,0 +1,15 @@
+{
+  "name": "LTSS Turbo - Long Time State Storage",
+  "content_in_root": false,
+  "render_readme": true,
+  "domains": ["ltss"],
+  "homeassistant": "2023.1.0",
+  "iot_class": "Local Push",
+  "country": ["US", "CA", "GB", "DE", "FR", "NL", "AU", "SE", "NO", "DK", "FI"],
+  "requirements": [
+    "sqlalchemy>=2.0.20,<3.0",
+    "psycopg2-binary>=2.9.7,<3.0",
+    "geoalchemy2>=0.14.0,<1.0",
+    "asyncpg>=0.28.0,<1.0"
+  ]
+}

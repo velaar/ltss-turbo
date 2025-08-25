@@ -1,0 +1,19 @@
+{
+  "domain": "ltss",
+  "version": "3.0.0",
+  "name": "Long Time State Storage Turbo (LTSS)",
+  "documentation": "https://github.com/velaar/ltss-turbo",
+  "issue_tracker": "https://github.com/velaar/ltss-turbo/issues",
+  "requirements": [
+    "sqlalchemy>=2.0.20,<3.0",
+    "psycopg2-binary>=2.9.7,<3.0",
+    "geoalchemy2>=0.14.0,<1.0",
+    "asyncpg>=0.28.0,<1.0"
+  ],
+  "dependencies": [],
+  "codeowners": [
+    "@velaar"
+  ],
+  "iot_class": "local_push",
+  "loggers": ["ltss"]
+}

@@ -1,0 +1,68 @@
+# LTSS Turbo Service Definitions
+
+# Force compression of old chunks
+compress_chunks:
+  name: Compress Old Chunks
+  description: >
+    Manually trigger compression of TimescaleDB chunks older than specified days.
+    Useful for immediate compression instead of waiting for automatic policy.
+  fields:
+    older_than_days:
+      name: Older Than Days
+      description: Compress chunks older than this many days
+      required: false
+      default: 7
+      example: 7
+      selector:
+        number:
+          min: 1
+          max: 365
+          unit_of_measurement: days
+
+# Get statistics about the database
+get_statistics:
+  name: Get Statistics
+  description: >
+    Get current statistics about the LTSS database including size, row count,
+    compression ratio, and performance metrics.
+
+# Manually vacuum the database
+vacuum_analyze:
+  name: Vacuum and Analyze
+  description: >
+    Run VACUUM ANALYZE on the LTSS table to optimize query performance
+    and reclaim storage space. This is normally done automatically by PostgreSQL.
+
+# Export data to CSV
+export_data:
+  name: Export Data
+  description: >
+    Export LTSS data to CSV format for backup or analysis.
+    Large exports will be chunked to prevent memory issues.
+  fields:
+    entity_id:
+      name: Entity ID
+      description: Entity to export (leave empty for all)
+      required: false
+      example: sensor.living_room_temperature
+      selector:
+        entity:
+    start_date:
+      name: Start Date
+      description: Export data from this date
+      required: false
+      selector:
+        datetime:
+    end_date:
+      name: End Date
+      description: Export data until this date
+      required: false
+      selector:
+        datetime:
+    output_path:
+      name: Output Path
+      description: Path to save the CSV file
+      required: true
+      example: /config/ltss_export.csv
+      selector:
+        text:

@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Documentation
+docs/_build/
+
+# Logs
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sql
+
+# Config (local testing)
+configuration.yaml
+secrets.yaml
+
+# Home Assistant
+.storage/
+.cloud/
+.HA_VERSION
+home-assistant.log*
+home-assistant_v2.db*
+
+# Development
+.env
+.env.local
+scratch/
+test_data/

@@ -441,7 +441,7 @@ class LTSS_DB(threading.Thread):
         This method uses:
         - CSV mode with TAB delimiter for reliable quoting
         - NULL as \\N which PostgreSQL understands
-        - Proper JSON serialization without double-quoting
+        - Proper JSON serialization with datetime handling
         - Normalized booleans and numerics to avoid locale issues
         """
         # Collect once to allow len() checks without exhausting an iterator
@@ -469,21 +469,28 @@ class LTSS_DB(threading.Thread):
             return "true" if bool(flag) else "false"
 
         def _to_json_or_none(obj: Optional[Any]) -> Optional[str]:
-            """Convert object to JSON string, handling NaN/Inf values."""
+            """Convert object to JSON string, handling datetime, NaN/Inf values."""
             if obj is None:
                 return None
             
             def _clean_value(x):
-                """Clean NaN/Inf values from data."""
+                """Clean problematic values from data."""
                 try:
-                    if isinstance(x, float):
+                    # Handle datetime objects
+                    if hasattr(x, 'isoformat'):
+                        return x.isoformat()
+                    # Handle date objects  
+                    elif hasattr(x, 'strftime'):
+                        return x.strftime('%Y-%m-%d')
+                    # Handle float edge cases
+                    elif isinstance(x, float):
                         if x != x:  # NaN
                             return None
                         if x == float("inf") or x == float("-inf"):
                             return None
                     return x
                 except Exception:
-                    return x
+                    return str(x) if x is not None else None
 
             def _recurse_clean(val):
                 """Recursively clean nested data structures."""
@@ -494,7 +501,7 @@ class LTSS_DB(threading.Thread):
                 return _clean_value(val)
 
             cleaned = _recurse_clean(obj)
-            return json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            return json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"), allow_nan=False, default=str)
 
         # Build the in-memory CSV/TSV
         buffer = StringIO()
@@ -526,8 +533,8 @@ class LTSS_DB(threading.Thread):
         if getattr(self, "enable_location", False):
             columns.append("location")
 
-        # Use raw string to avoid escape sequence issues
-        NULL_VALUE = r"\N"
+        # PostgreSQL NULL representation
+        NULL_VALUE = "\\N"
 
         for row in rows:
             # Build row data with proper NULL handling
@@ -554,12 +561,12 @@ class LTSS_DB(threading.Thread):
 
         buffer.seek(0)
 
-        # Build COPY command using PostgreSQL CSV format
+        # Build COPY command using PostgreSQL CSV format with corrected syntax
         conn = self._get_copy_connection()
         cols_sql = ", ".join(columns)
         copy_sql = (
             f"COPY {self.table_name} ({cols_sql}) "
-            r"FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', QUOTE '\"', ESCAPE '\\', NULL '\N')"
+            f"FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', QUOTE E'\"', ESCAPE E'\\\\', NULL E'\\\\N')"
         )
 
         try:

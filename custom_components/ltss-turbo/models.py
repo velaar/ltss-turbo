@@ -454,7 +454,7 @@ def make_ltss_model(table_name: str = "ltss_turbo"):
                     last_updated=getattr(state, "last_updated", event.time_fired),
                     is_unavailable=is_unavailable,
                     is_unknown=is_unknown,
-                    location=location,  # Always processed, may be None
+                    location=location,
                 )
                 
             except Exception as e:

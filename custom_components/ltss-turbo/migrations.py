@@ -46,9 +46,9 @@ def run_startup_migrations(engine: Engine, table_name: str = "ltss_turbo",
             current_version = _get_schema_version(conn, table_name)
             
             if current_version is None:
-                # Fresh install - run initial setup with mandatory location
+                # Fresh install - run initial setup
                 _LOGGER.info("Fresh LTSS Turbo installation detected, running initial setup with mandatory PostGIS...")
-                _run_initial_setup_mandatory_location(conn, engine, table_name, enable_timescale, 
+                _run_initial_setup(conn, engine, table_name, enable_timescale, 
                                                     chunk_time_interval)
                 current_version = 0
             
@@ -114,7 +114,7 @@ def _set_schema_version(conn, table_name: str, version: int):
         SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
     """), {"version": str(version)})
 
-def _run_initial_setup_mandatory_location(conn, engine: Engine, table_name: str,
+def _run_initial_setup(conn, engine: Engine, table_name: str,
                                         enable_timescale: bool, chunk_time_interval: int):
     """Run initial setup with mandatory PostGIS location support."""
     
@@ -146,9 +146,6 @@ def _run_initial_setup_mandatory_location(conn, engine: Engine, table_name: str,
     from .models import Base, make_ltss_model
     Model = make_ltss_model(table_name)
     
-    # Location is now always activated
-    # Note: The model now always includes the location column
-
     # Create table if missing
     if not inspector.has_table(table_name):
         _LOGGER.info(f"Creating table '{table_name}' with mandatory location column...")
@@ -269,7 +266,7 @@ def _configure_timescaledb_policies(conn, table_name: str, enable_compression: b
 
 @migration(1)
 def _v1_add_core_indexes(conn, table_name: str, engine: Engine):
-    """Version 1: Add core performance indexes including location."""
+    """Version 1: Add core performance indexes including"""
     
     indexes = [
         # Core indexes
@@ -293,7 +290,6 @@ def _v1_add_core_indexes(conn, table_name: str, engine: Engine):
             "columns": "entity_id, state_numeric, time DESC",
             "where": "state_numeric IS NOT NULL"
         },
-        # Location index for PostGIS queries
         {
             "name": f"ix_{table_name}_location_gist",
             "columns": "location",

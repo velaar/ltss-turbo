@@ -15,7 +15,7 @@ from typing import Any, Callable, Iterable, List, Optional
 
 # Third-party libraries
 import voluptuous as vol
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.pool import QueuePool
@@ -336,9 +336,21 @@ class ConnectionManager:
                 # Set optimal settings for bulk operations
                 with self._copy_connection.cursor() as cur:
                     # Optimize for bulk operations
-                    cur.execute("SET synchronous_commit = OFF")
-                    cur.execute("SET wal_buffers = '64MB'")
-                    cur.execute("SET checkpoint_completion_target = 0.9")
+                    # Note: These settings work with both direct PostgreSQL and pgbouncer
+                    try:
+                        cur.execute("SET synchronous_commit = OFF")
+                        cur.execute("SET statement_timeout = 30000")  # Set after connection
+                    except Exception as e:
+                        # Some settings might not be available through pgbouncer
+                        _LOGGER.debug(f"Could not set all connection optimizations: {e}")
+                    
+                    # These are more likely to work with pgbouncer
+                    try:
+                        cur.execute("SET wal_buffers = '64MB'")
+                        cur.execute("SET checkpoint_completion_target = 0.9")
+                    except Exception as e:
+                        _LOGGER.debug(f"Could not set WAL optimizations: {e}")
+                        
                 return self._copy_connection
                 
             except Exception as e:
@@ -707,9 +719,49 @@ class LTSS_DB(threading.Thread):
                     )
                     self.stats["events_dropped"] += 1
 
+    def _detect_pgbouncer(self, db_url: str) -> bool:
+        """Detect if we're connecting through pgbouncer based on URL patterns."""
+        # Common pgbouncer ports
+        pgbouncer_ports = ['6432', '5433']  
+        
+        # Check for common pgbouncer ports
+        for port in pgbouncer_ports:
+            if f':{port}' in db_url:
+                return True
+                
+        # Check for common pgbouncer hostnames
+        pgbouncer_patterns = ['pgbouncer', 'bouncer', 'pool']
+        for pattern in pgbouncer_patterns:
+            if pattern in db_url.lower():
+                return True
+                
+        return False
+
+    def _get_connect_args(self) -> dict:
+        """Get connection arguments optimized for the connection type."""
+        is_pgbouncer = self._detect_pgbouncer(self.db_url)
+        
+        base_args = {
+            "connect_timeout": 10,
+            "application_name": "ltss_turbo",
+        }
+        
+        if not is_pgbouncer:
+            # Direct PostgreSQL connection - we can use startup parameters
+            base_args["options"] = "-c statement_timeout=30000"
+            _LOGGER.debug("Using direct PostgreSQL connection args")
+        else:
+            # pgbouncer connection - avoid startup parameters that it doesn't support
+            _LOGGER.info("Detected pgbouncer connection, using compatible connection args")
+            
+        return base_args
+
     def _setup_connection(self):
         if self.engine is not None:
             self.engine.dispose()
+
+        # Get appropriate connection arguments
+        connect_args = self._get_connect_args()
 
         # Optimized connection settings for pgbouncer
         self.engine = create_engine(
@@ -723,12 +775,8 @@ class LTSS_DB(threading.Thread):
             pool_pre_ping=False,  # pgbouncer handles connection health
             pool_recycle=-1,  # Let pgbouncer handle connection lifecycle
             
-            # Connection-level optimizations
-            connect_args={
-                "connect_timeout": 10,
-                "application_name": "ltss_turbo",
-                "options": "-c statement_timeout=30000"
-            },
+            # Connection-level optimizations (pgbouncer compatible)
+            connect_args=connect_args,
             
             # Performance settings
             isolation_level="READ_COMMITTED",
@@ -759,9 +807,10 @@ class LTSS_DB(threading.Thread):
         self.get_session = scoped_session(sessionmaker(bind=self.engine))
         
         _LOGGER.info(
-            "LTSS Turbo optimized connection initialized: table=%s, compression=%s",
+            "LTSS Turbo optimized connection initialized: table=%s, compression=%s, pgbouncer_mode=%s",
             self.table_name,
-            "enabled" if self.enable_compression else "disabled"
+            "enabled" if self.enable_compression else "disabled",
+            "detected" if self._detect_pgbouncer(self.db_url) else "direct"
         )
 
 
@@ -780,4 +829,3 @@ class LTSS_DB(threading.Thread):
             self.engine = None
             
         _LOGGER.info("Optimized database connections closed")
-

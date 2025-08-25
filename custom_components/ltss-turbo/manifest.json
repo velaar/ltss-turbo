@@ -1,5 +1,5 @@
 {
-  "domain": "ltss-turbo",
+  "domain": "ltss_turbo",
   "version": "3.0.0",
   "name": "Long Time State Storage Turbo (LTSS)",
   "documentation": "https://github.com/velaar/ltss-turbo",

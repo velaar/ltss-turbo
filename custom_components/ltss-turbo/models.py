@@ -303,3 +303,4 @@ def make_ltss_model(table_name: str = "ltss_turbo"):
             except Exception as e:
                 _LOGGER.error(f"Error creating LTSS record from event: {e}", exc_info=True)
                 return None
+    return LTSS

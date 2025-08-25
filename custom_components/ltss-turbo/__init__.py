@@ -1,57 +1,51 @@
 """Long Time State Storage Turbo - Optimized for TimescaleDB and Grafana."""
 
+# Standard library
 import asyncio
 import concurrent.futures
-from contextlib import contextmanager
-from datetime import datetime, timedelta
+import csv
+import json
 import logging
 import queue
 import threading
 import time
-import json
-import csv
-from typing import Any, Dict, Optional, Callable, List
-from io import StringIO, BytesIO
+from io import StringIO
+from typing import Any, Callable, Iterable, List, Optional
 
+# Third-party libraries
 import voluptuous as vol
-from sqlalchemy import exc, create_engine, inspect, text, pool
+from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.pool import NullPool, QueuePool
+from sqlalchemy.pool import QueuePool
 
-import psycopg2
-from psycopg2.extras import execute_values
-
-from .models import Base, make_ltss_model
-from .migrations import run_startup_migrations
-
+# Home Assistant core
+from homeassistant.components import persistent_notification
 from homeassistant.const import (
     ATTR_ENTITY_ID,
-    CONF_DOMAINS,
-    CONF_ENTITIES,
-    CONF_EXCLUDE,
-    CONF_INCLUDE,
     EVENT_HOMEASSISTANT_START,
     EVENT_HOMEASSISTANT_STOP,
     EVENT_STATE_CHANGED,
     STATE_UNKNOWN,
 )
-from homeassistant.components import persistent_notification
 from homeassistant.core import CoreState, HomeAssistant, callback
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entityfilter import (
-    convert_include_exclude_filter,
     INCLUDE_EXCLUDE_BASE_FILTER_SCHEMA,
+    convert_include_exclude_filter,
 )
 from homeassistant.helpers.typing import ConfigType
 import homeassistant.util.dt as dt_util
 from homeassistant.helpers.json import JSONEncoder
 
+# Local packages
+from .migrations import run_startup_migrations
+from .models import make_ltss_model
 #from .services import setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = "ltss"
+DOMAIN = "ltss_turbo"
 
 # Configuration constants
 CONF_DB_URL = "db_url"
@@ -440,73 +434,146 @@ class LTSS_DB(threading.Thread):
         for _ in batch:
             self.queue.task_done()
 
-    def _bulk_insert_copy(self, rows: List[Any]) -> None:
-        """Use PostgreSQL COPY for efficient bulk insert with optimized formatting."""
+
+
+    def _bulk_insert_copy(self, rows: Iterable[Any]) -> None:
+        """
+        Safer COPY implementation:
+        - Uses CSV mode with a TAB delimiter so the csv.writer's quoting is respected.
+        - Emits NULL as \N which Postgres understands via NULL '\N'.
+        - Serializes JSON without double-quoting (no wrapping quotes); Postgres parses it into JSONB.
+        - Normalizes booleans and numerics to strings to avoid locale issues.
+        """
+        # Collect once to allow len() checks without exhausting an iterator
+        rows = list(rows)
         if not rows:
             return
-            
-        # Use CSV writer for more efficient and safer formatting
+
+        def _iso(dt: Optional[Any]) -> Optional[str]:
+            if not dt:
+                return None
+            # Prefer isoformat with 'Z' for UTC if available; fall back to isoformat()
+            try:
+                # If datetime has tzinfo, normalize to ISO 8601
+                return dt.isoformat()
+            except Exception:
+                return str(dt)
+
+        def _to_str_or_none(v: Optional[Any]) -> Optional[str]:
+            if v is None:
+                return None
+            # Avoid locale commas and weird reprs; always plain str
+            return str(v)
+
+        def _to_bool_str(flag: Optional[bool]) -> str:
+            return "true" if bool(flag) else "false"
+
+        def _to_json_or_none(obj: Optional[Any]) -> Optional[str]:
+            if obj is None:
+                return None
+            # Ensure valid JSON (no NaN/Infinity) so Postgres accepts it for JSONB
+            def _nan_clean(x):
+                # Replace NaN/Inf in typical numeric containers
+                try:
+                    if isinstance(x, float):
+                        if x != x:  # NaN
+                            return None
+                        if x == float("inf") or x == float("-inf"):
+                            return None
+                    return x
+                except Exception:
+                    return x
+
+            def _recurse(val):
+                if isinstance(val, dict):
+                    return {k: _recurse(v) for k, v in val.items()}
+                if isinstance(val, (list, tuple)):
+                    return [_recurse(v) for v in val]
+                return _nan_clean(val)
+
+            cleaned = _recurse(obj)
+            return json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+        # Build the in-memory CSV/TSV
         buffer = StringIO()
-        writer = csv.writer(buffer, delimiter='\t', quoting=csv.QUOTE_MINIMAL, 
-                           escapechar='\\', lineterminator='\n')
-            
+        writer = csv.writer(
+            buffer,
+            delimiter="\t",          # TSV
+            quoting=csv.QUOTE_MINIMAL,
+            escapechar="\\",         # escape backslashes/newlines as needed
+            lineterminator="\n",
+        )
+
+        # Base column order
+        columns = [
+            "time",
+            "entity_id",
+            "state",
+            "attributes",
+            "friendly_name",
+            "unit_of_measurement",
+            "device_class",
+            "icon",
+            "domain",
+            "state_numeric",
+            "last_changed",
+            "last_updated",
+            "is_unavailable",
+            "is_unknown",
+        ]
+        if getattr(self, "enable_location", False):
+            columns.append("location")
+
+        NULL = r"\N"
+
         for row in rows:
-            # Pre-format common values to avoid repeated operations
-            row_data = [
-                row.time.isoformat() if row.time else "\\N",
-                row.entity_id or "\\N",
-                row.state or "\\N",  # CSV writer handles escaping
-                json.dumps(row.attributes, cls=JSONEncoder) if row.attributes else "\\N",
-                row.friendly_name or "\\N",
-                row.unit_of_measurement or "\\N",
-                row.device_class or "\\N",
-                row.icon or "\\N",
-                row.domain or "\\N",
-                str(row.state_numeric) if row.state_numeric is not None else "\\N",
-                row.last_changed.isoformat() if row.last_changed else "\\N",
-                row.last_updated.isoformat() if row.last_updated else "\\N",
-                "true" if row.is_unavailable else "false",
-                "true" if row.is_unknown else "false",
+            # NOTE: attribute names match your model; adapt if your row objects differ
+            payload = [
+                _iso(getattr(row, "time", None)) or NULL,
+                _to_str_or_none(getattr(row, "entity_id", None)) or NULL,
+                _to_str_or_none(getattr(row, "state", None)) or NULL,
+                _to_json_or_none(getattr(row, "attributes", None)) or NULL,
+                _to_str_or_none(getattr(row, "friendly_name", None)) or NULL,
+                _to_str_or_none(getattr(row, "unit_of_measurement", None)) or NULL,
+                _to_str_or_none(getattr(row, "device_class", None)) or NULL,
+                _to_str_or_none(getattr(row, "icon", None)) or NULL,
+                _to_str_or_none(getattr(row, "domain", None)) or NULL,
+                _to_str_or_none(getattr(row, "state_numeric", None)) or NULL,
+                _iso(getattr(row, "last_changed", None)) or NULL,
+                _iso(getattr(row, "last_updated", None)) or NULL,
+                _to_bool_str(getattr(row, "is_unavailable", False)),
+                _to_bool_str(getattr(row, "is_unknown", False)),
             ]
-            
-            # Add location if enabled in config
-            if self.enable_location:
-                row_data.append(getattr(row, "location", None) or "\\N")
-            
-            writer.writerow(row_data)
-        
+            if "location" in columns:
+                payload.append(_to_str_or_none(getattr(row, "location", None)) or NULL)
+
+            writer.writerow(payload)
+
         buffer.seek(0)
-        
-        # Use dedicated connection for COPY operations (reuses connection)
+
+        # Build COPY ... WITH (FORMAT csv) using copy_expert so Postgres parses CSV quoting
         conn = self._get_copy_connection()
+        cols_sql = ", ".join(columns)
+        copy_sql = (
+            f"COPY {self.table_name} ({cols_sql}) "
+            "FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', QUOTE '\"', ESCAPE '\\\\', NULL '\\N')"
+        )
+
         try:
-            with conn.cursor() as cursor:
-                # Define columns once
-                columns = [
-                    "time", "entity_id", "state", "attributes", "friendly_name",
-                    "unit_of_measurement", "device_class", "icon", "domain",
-                    "state_numeric", "last_changed", "last_updated",
-                    "is_unavailable", "is_unknown"
-                ]
-                
-                if self.enable_location:
-                    columns.append("location")
-                
-                cursor.copy_from(
-                    buffer,
-                    self.table_name,
-                    columns=columns,
-                    null="\\N", 
-                    sep="\t"
-                )
+            with conn.cursor() as cur:
+                cur.copy_expert(copy_sql, buffer)
             conn.commit()
-        except Exception as e:
-            conn.rollback()
-            # Force reconnection on error
-            self._close_copy_connection()
-            raise e
+        except Exception:
+            # Rollback and drop the connection so a fresh one is used next time
+            try:
+                conn.rollback()
+            finally:
+                self._close_copy_connection()
+            raise
         finally:
             buffer.close()
+
+
 
     @callback
     def event_listener(self, event):

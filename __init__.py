@@ -75,7 +75,7 @@ DEFAULT_POLL_INTERVAL_MS = 100
 DEFAULT_COMPRESSION_AFTER = 7  # Compress chunks older than 7 days by default
 DEFAULT_POOL_SIZE = 5
 DEFAULT_MAX_OVERFLOW = 10
-DEFAULT_TABLE_NAME = "ltss-turbo"
+DEFAULT_TABLE_NAME = "ltss"
 
 CONFIG_SCHEMA = vol.Schema(
     {

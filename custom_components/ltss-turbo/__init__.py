@@ -434,15 +434,15 @@ class LTSS_DB(threading.Thread):
         for _ in batch:
             self.queue.task_done()
 
-
-
     def _bulk_insert_copy(self, rows: Iterable[Any]) -> None:
         """
-        Safer COPY implementation:
-        - Uses CSV mode with a TAB delimiter so the csv.writer's quoting is respected.
-        - Emits NULL as \N which Postgres understands via NULL '\N'.
-        - Serializes JSON without double-quoting (no wrapping quotes); Postgres parses it into JSONB.
-        - Normalizes booleans and numerics to strings to avoid locale issues.
+        Safer COPY implementation using CSV format with proper escaping.
+        
+        This method uses:
+        - CSV mode with TAB delimiter for reliable quoting
+        - NULL as \\N which PostgreSQL understands
+        - Proper JSON serialization without double-quoting
+        - Normalized booleans and numerics to avoid locale issues
         """
         # Collect once to allow len() checks without exhausting an iterator
         rows = list(rows)
@@ -450,30 +450,31 @@ class LTSS_DB(threading.Thread):
             return
 
         def _iso(dt: Optional[Any]) -> Optional[str]:
+            """Convert datetime to ISO format or return None."""
             if not dt:
                 return None
-            # Prefer isoformat with 'Z' for UTC if available; fall back to isoformat()
             try:
-                # If datetime has tzinfo, normalize to ISO 8601
                 return dt.isoformat()
             except Exception:
                 return str(dt)
 
         def _to_str_or_none(v: Optional[Any]) -> Optional[str]:
+            """Convert value to string or return None."""
             if v is None:
                 return None
-            # Avoid locale commas and weird reprs; always plain str
             return str(v)
 
         def _to_bool_str(flag: Optional[bool]) -> str:
+            """Convert boolean to string."""
             return "true" if bool(flag) else "false"
 
         def _to_json_or_none(obj: Optional[Any]) -> Optional[str]:
+            """Convert object to JSON string, handling NaN/Inf values."""
             if obj is None:
                 return None
-            # Ensure valid JSON (no NaN/Infinity) so Postgres accepts it for JSONB
-            def _nan_clean(x):
-                # Replace NaN/Inf in typical numeric containers
+            
+            def _clean_value(x):
+                """Clean NaN/Inf values from data."""
                 try:
                     if isinstance(x, float):
                         if x != x:  # NaN
@@ -484,23 +485,24 @@ class LTSS_DB(threading.Thread):
                 except Exception:
                     return x
 
-            def _recurse(val):
+            def _recurse_clean(val):
+                """Recursively clean nested data structures."""
                 if isinstance(val, dict):
-                    return {k: _recurse(v) for k, v in val.items()}
+                    return {k: _recurse_clean(v) for k, v in val.items()}
                 if isinstance(val, (list, tuple)):
-                    return [_recurse(v) for v in val]
-                return _nan_clean(val)
+                    return [_recurse_clean(v) for v in val]
+                return _clean_value(val)
 
-            cleaned = _recurse(obj)
+            cleaned = _recurse_clean(obj)
             return json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
         # Build the in-memory CSV/TSV
         buffer = StringIO()
         writer = csv.writer(
             buffer,
-            delimiter="\t",          # TSV
+            delimiter="\t",
             quoting=csv.QUOTE_MINIMAL,
-            escapechar="\\",         # escape backslashes/newlines as needed
+            escapechar="\\",
             lineterminator="\n",
         )
 
@@ -524,39 +526,40 @@ class LTSS_DB(threading.Thread):
         if getattr(self, "enable_location", False):
             columns.append("location")
 
-        NULL = r"\N"
+        # Use raw string to avoid escape sequence issues
+        NULL_VALUE = r"\N"
 
         for row in rows:
-            # NOTE: attribute names match your model; adapt if your row objects differ
+            # Build row data with proper NULL handling
             payload = [
-                _iso(getattr(row, "time", None)) or NULL,
-                _to_str_or_none(getattr(row, "entity_id", None)) or NULL,
-                _to_str_or_none(getattr(row, "state", None)) or NULL,
-                _to_json_or_none(getattr(row, "attributes", None)) or NULL,
-                _to_str_or_none(getattr(row, "friendly_name", None)) or NULL,
-                _to_str_or_none(getattr(row, "unit_of_measurement", None)) or NULL,
-                _to_str_or_none(getattr(row, "device_class", None)) or NULL,
-                _to_str_or_none(getattr(row, "icon", None)) or NULL,
-                _to_str_or_none(getattr(row, "domain", None)) or NULL,
-                _to_str_or_none(getattr(row, "state_numeric", None)) or NULL,
-                _iso(getattr(row, "last_changed", None)) or NULL,
-                _iso(getattr(row, "last_updated", None)) or NULL,
+                _iso(getattr(row, "time", None)) or NULL_VALUE,
+                _to_str_or_none(getattr(row, "entity_id", None)) or NULL_VALUE,
+                _to_str_or_none(getattr(row, "state", None)) or NULL_VALUE,
+                _to_json_or_none(getattr(row, "attributes", None)) or NULL_VALUE,
+                _to_str_or_none(getattr(row, "friendly_name", None)) or NULL_VALUE,
+                _to_str_or_none(getattr(row, "unit_of_measurement", None)) or NULL_VALUE,
+                _to_str_or_none(getattr(row, "device_class", None)) or NULL_VALUE,
+                _to_str_or_none(getattr(row, "icon", None)) or NULL_VALUE,
+                _to_str_or_none(getattr(row, "domain", None)) or NULL_VALUE,
+                _to_str_or_none(getattr(row, "state_numeric", None)) or NULL_VALUE,
+                _iso(getattr(row, "last_changed", None)) or NULL_VALUE,
+                _iso(getattr(row, "last_updated", None)) or NULL_VALUE,
                 _to_bool_str(getattr(row, "is_unavailable", False)),
                 _to_bool_str(getattr(row, "is_unknown", False)),
             ]
             if "location" in columns:
-                payload.append(_to_str_or_none(getattr(row, "location", None)) or NULL)
+                payload.append(_to_str_or_none(getattr(row, "location", None)) or NULL_VALUE)
 
             writer.writerow(payload)
 
         buffer.seek(0)
 
-        # Build COPY ... WITH (FORMAT csv) using copy_expert so Postgres parses CSV quoting
+        # Build COPY command using PostgreSQL CSV format
         conn = self._get_copy_connection()
         cols_sql = ", ".join(columns)
         copy_sql = (
             f"COPY {self.table_name} ({cols_sql}) "
-            "FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', QUOTE '\"', ESCAPE '\\\\', NULL '\\N')"
+            r"FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', QUOTE '\"', ESCAPE '\\', NULL '\N')"
         )
 
         try:
@@ -572,8 +575,6 @@ class LTSS_DB(threading.Thread):
             raise
         finally:
             buffer.close()
-
-
 
     @callback
     def event_listener(self, event):

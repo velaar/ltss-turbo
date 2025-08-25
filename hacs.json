@@ -2,7 +2,7 @@
   "name": "LTSS Turbo - Long Time State Storage",
   "content_in_root": false,
   "render_readme": true,
-  "domains": ["ltss"],
+  "domains": ["ltss-turbo"],
   "homeassistant": "2023.1.0",
   "iot_class": "Local Push",
   "country": ["US", "CA", "GB", "DE", "FR", "NL", "AU", "SE", "NO", "DK", "FI"],

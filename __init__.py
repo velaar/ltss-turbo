@@ -21,6 +21,8 @@ from sqlalchemy.pool import NullPool, QueuePool
 import psycopg2
 from psycopg2.extras import execute_values
 
+from .models import Base, LTSS
+
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     CONF_DOMAINS,
@@ -48,7 +50,7 @@ from .services import setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = "ltss"
+DOMAIN = "ltss-turbo"
 
 # Configuration constants
 CONF_DB_URL = "db_url"
@@ -62,6 +64,7 @@ CONF_POOL_SIZE = "pool_size"
 CONF_MAX_OVERFLOW = "max_overflow"
 CONF_ENABLE_COMPRESSION = "enable_compression"
 CONF_ENABLE_LOCATION = "enable_location"
+CONF_TABLE_NAME = "table_name"
 
 CONNECT_RETRY_WAIT = 3
 DEFAULT_CHUNK_INTERVAL = 86400000000  # 1 day in microseconds (better for compression)
@@ -71,6 +74,7 @@ DEFAULT_POLL_INTERVAL_MS = 100
 DEFAULT_COMPRESSION_AFTER = 7  # Compress chunks older than 7 days
 DEFAULT_POOL_SIZE = 5
 DEFAULT_MAX_OVERFLOW = 10
+DEFAULT_TABLE_NAME = "ltss-turbo"
 
 CONFIG_SCHEMA = vol.Schema(
     {
@@ -101,6 +105,7 @@ CONFIG_SCHEMA = vol.Schema(
                 ): vol.Range(min=0, max=50),
                 vol.Optional(CONF_ENABLE_COMPRESSION, default=True): cv.boolean,
                 vol.Optional(CONF_ENABLE_LOCATION, default=False): cv.boolean,
+                vol.Optional(CONF_TABLE_NAME, default=DEFAULT_TABLE_NAME): cv.string,
             }
         )
     },
@@ -123,6 +128,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     max_overflow = conf.get(CONF_MAX_OVERFLOW)
     enable_compression = conf.get(CONF_ENABLE_COMPRESSION)
     enable_location = conf.get(CONF_ENABLE_LOCATION)
+    table_name = conf.get(CONF_TABLE_NAME)
     entity_filter = convert_include_exclude_filter(conf)
 
     instance = LTSS_DB(
@@ -172,6 +178,7 @@ class LTSS_DB(threading.Thread):
         max_overflow: int = DEFAULT_MAX_OVERFLOW,
         enable_compression: bool = True,
         enable_location: bool = False,
+        table_name: str = DEFAULT_TABLE_NAME,
     ) -> None:
         """Initialize the LTSS database handler."""
         threading.Thread.__init__(self, name="LTSS-Turbo")
@@ -180,6 +187,7 @@ class LTSS_DB(threading.Thread):
         self.queue: queue.Queue = queue.Queue(maxsize=batch_size * 10)
         self.recording_start = dt_util.utcnow()
         self.db_url = uri
+        self.table_name = table_name
         self.chunk_time_interval = chunk_time_interval
         self.async_db_ready = asyncio.Future()
         self.engine: Optional[Engine] = None
@@ -206,6 +214,9 @@ class LTSS_DB(threading.Thread):
             "batches_processed": 0,
             "last_batch_time": None,
         }
+
+        # Set the table name on the model
+        LTSS.set_table_name(self.table_name)
 
     @callback
     def async_initialize(self):
@@ -457,6 +468,7 @@ class LTSS_DB(threading.Thread):
                 cursor.copy_from(
                     buffer,
                     LTSS.__tablename__,
+                    self.table_name,
                     columns=columns,
                     null="\\N",
                     sep="\t"
@@ -524,11 +536,15 @@ class LTSS_DB(threading.Thread):
             if not inspector.has_table(LTSS.__tablename__):
                 self._create_table(available_extensions)
             else:
-                _LOGGER.info("LTSS table already exists")
+                _LOGGER.info("LTSS Turbo Table '%s' found", self.table_name)
 
             # Set up TimescaleDB optimizations
             if "timescaledb" in available_extensions:
                 self._setup_timescaledb(con)
+
+            # Create indexes for the table
+            from .models import create_ltss_indexes
+            create_ltss_indexes(self.table_name)
 
         self.get_session = scoped_session(sessionmaker(bind=self.engine))
         
@@ -559,7 +575,7 @@ class LTSS_DB(threading.Thread):
                 con.execute(
                     text(
                         f"""SELECT create_hypertable(
-                            '{LTSS.__tablename__}',
+                            '{self.table_name}',
                             'time',
                             chunk_time_interval => INTERVAL '{self.chunk_time_interval // 1000000} seconds',
                             if_not_exists => TRUE
@@ -576,7 +592,7 @@ class LTSS_DB(threading.Thread):
             con.execute(
                 text(
                     f"""SELECT set_chunk_time_interval(
-                        '{LTSS.__tablename__}',
+                        '{self.table_name}',
                         INTERVAL '{self.chunk_time_interval // 1000000} seconds'
                     );"""
                 )
@@ -603,7 +619,7 @@ class LTSS_DB(threading.Thread):
             # Enable compression on the hypertable
             con.execute(
                 text(
-                    f"""ALTER TABLE {LTSS.__tablename__} SET (
+                    f"""ALTER TABLE {self.table_name} SET (
                         timescaledb.compress,
                         timescaledb.compress_segmentby = 'entity_id',
                         timescaledb.compress_orderby = 'time DESC',
@@ -616,7 +632,7 @@ class LTSS_DB(threading.Thread):
             con.execute(
                 text(
                     f"""SELECT add_compression_policy(
-                        '{LTSS.__tablename__}',
+                        '{self.table_name}',
                         INTERVAL '{self.compression_after} days',
                         if_not_exists => TRUE
                     );"""
@@ -637,7 +653,7 @@ class LTSS_DB(threading.Thread):
             con.execute(
                 text(
                     f"""SELECT add_retention_policy(
-                        '{LTSS.__tablename__}',
+                        '{self.table_name}',
                         INTERVAL '{self.retention_days} days',
                         if_not_exists => TRUE
                     );"""

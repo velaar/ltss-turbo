@@ -69,7 +69,7 @@ SPECIAL_STATES = {
 class LTSS(Base):
     """Optimized state change history for time-series storage."""
 
-    __tablename__ = "ltss"
+    __tablename__ = None # Will be set dynamically
     
     # Primary keys - optimized for TimescaleDB partitioning
     time = Column(DateTime(timezone=True), primary_key=True, nullable=False)
@@ -99,7 +99,10 @@ class LTSS(Base):
     
     # Optional location (activated via PostGIS)
     location = None
-
+    @classmethod
+    def set_table_name(cls, table_name: str):
+        """Set the table name dynamically."""
+        cls.__tablename__ = table_name
     @classmethod
     def activate_location_extraction(cls):
         """Enable PostGIS location support."""
@@ -163,8 +166,18 @@ class LTSS(Base):
                 return float(options.index(raw_state))
             except (ValueError, TypeError):
                 pass
+        # 6. Handle percentages (convert to decimal)
+        if "%" in raw_state:
+            # Clean and extract percentage value
+            cleaned = raw_state.replace("\u00A0", " ").replace("\u200B", "").replace("%", "").strip()
+            match = NUMERIC_EXTRACT_PATTERN.search(cleaned)
+            if match:
+                try:
+                    return float(match.group(0)) / 100.0
+                except (ValueError, TypeError):
+                    pass
         
-        # 6. Extract numeric from string (last resort)
+        # 7. Extract numeric from string (last resort)
         # Clean non-breaking spaces and zero-width spaces
         cleaned = raw_state.replace("\u00A0", " ").replace("\u200B", "")
         match = NUMERIC_EXTRACT_PATTERN.search(cleaned)

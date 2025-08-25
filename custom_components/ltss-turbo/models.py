@@ -70,7 +70,11 @@ SPECIAL_STATES = {
     "fault": -5.0,
 }
 
-def make_ltss_model(table_name: str = "ltss"):
+def make_ltss_model(table_name: str = "ltss_turbo"):
+    # Remove any stale Table from metadata BEFORE redefining the class
+    if table_name in Base.metadata.tables:
+        Base.metadata.remove(Base.metadata.tables[table_name])
+
     class LTSS(Base):  
         __tablename__ = table_name
         __table_args__ = {"extend_existing": True}
@@ -299,5 +303,3 @@ def make_ltss_model(table_name: str = "ltss"):
             except Exception as e:
                 _LOGGER.error(f"Error creating LTSS record from event: {e}", exc_info=True)
                 return None
-    # hotfix for SQLAlchemy table caching issue
-    Base.metadata._remove_table(table_name, None)

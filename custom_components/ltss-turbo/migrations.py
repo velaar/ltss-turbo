@@ -120,57 +120,62 @@ def _set_schema_version(conn, table_name: str, version: int):
     """), {"version": str(version)})
 
 
-def _run_initial_setup(conn, engine: Engine, table_name: str, 
+def _run_initial_setup(conn, engine: Engine, table_name: str,
                       enable_timescale: bool, enable_location: bool,
                       chunk_time_interval: int):
-    """Run initial setup for fresh installation."""
     
     inspector = inspect(engine)
     
     # Check for available extensions
     extensions = _get_available_extensions(conn)
-    
-    # Enable TimescaleDB if available and requested
+
     if enable_timescale and "timescaledb" in extensions:
-        try:
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE"))
-            _LOGGER.info("TimescaleDB extension enabled")
-        except Exception as e:
-            _LOGGER.warning(f"Could not enable TimescaleDB: {e}")
-    
-    # Enable PostGIS if available and requested
+            try:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE"))
+                _LOGGER.info("TimescaleDB extension enabled")
+            except Exception as e:
+                _LOGGER.warning(f"Could not enable TimescaleDB: {e}")
+
+    # Ensure model is registered in metadata
+    from .models import Base, make_ltss_model
+    Model = make_ltss_model(table_name)
+
+    # Optionally enable PostGIS and location column on the model
     if enable_location and "postgis" in extensions:
         try:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis CASCADE"))
             _LOGGER.info("PostGIS extension enabled")
-            # This should trigger the model to add location column
-            from .models import LTSS
-            LTSS.activate_location_extraction()
+            Model.activate_location_extraction()
         except Exception as e:
             _LOGGER.warning(f"Could not enable PostGIS: {e}")
-    
-        # Create table if it doesn't exist
+
+    # Create table if missing (ALWAYS; not gated by PostGIS)
+    if not inspector.has_table(table_name):
+        _LOGGER.info(f"Creating table '{table_name}'...")
+        Base.metadata.create_all(engine, tables=[Base.metadata.tables[table_name]])
+
+        # re-check
+        inspector = inspect(engine)
         if not inspector.has_table(table_name):
-            _LOGGER.info(f"Creating table '{table_name}'...")
-            from .models import Base
-            Base.metadata.create_all(engine, tables=[Base.metadata.tables[table_name]])
-        else:
-            _LOGGER.info(f"Table '{table_name}' already exists — skipping creation")
-        # Convert to hypertable if TimescaleDB is available
-        if enable_timescale and "timescaledb" in extensions:
-            try:
-                conn.execute(text(f"""
-                    SELECT create_hypertable(
-                        '{table_name}',
-                        'time',
-                        chunk_time_interval => INTERVAL '{chunk_time_interval // 1000000} seconds',
-                        if_not_exists => TRUE,
-                        migrate_data => TRUE
-                    )
-                """))
-                _LOGGER.info(f"Hypertable created for '{table_name}'")
-            except Exception as e:
-                _LOGGER.warning(f"Could not create hypertable: {e}")
+            raise RuntimeError(f"Failed to create table '{table_name}'")
+    else:
+        _LOGGER.info(f"Table '{table_name}' already exists — skipping creation")
+
+    # Convert to hypertable if TimescaleDB is available
+    if enable_timescale and "timescaledb" in extensions:
+        try:
+            conn.execute(text(f"""
+                SELECT create_hypertable(
+                    '{table_name}',
+                    'time',
+                    chunk_time_interval => INTERVAL '{chunk_time_interval // 1_000_000} seconds',
+                    if_not_exists => TRUE,
+                    migrate_data => TRUE
+                )
+            """))
+            _LOGGER.info(f"Hypertable created for '{table_name}'")
+        except Exception as e:
+            _LOGGER.warning(f"Could not create hypertable: {e}")
 
 
 def _get_available_extensions(conn) -> set:

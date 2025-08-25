@@ -22,7 +22,7 @@ from sqlalchemy.pool import NullPool, QueuePool
 import psycopg2
 from psycopg2.extras import execute_values
 
-from .models import Base, LTSS
+from .models import Base, make_ltss_model
 from .migrations import run_startup_migrations
 
 from homeassistant.const import (
@@ -219,8 +219,7 @@ class LTSS_DB(threading.Thread):
             "last_batch_time": None,
         }
 
-        # Set the table name on the model
-        LTSS.set_table_name(self.table_name)
+        self.LTSS = make_ltss_model(self.table_name)
 
     @callback
     def async_initialize(self):
@@ -547,8 +546,7 @@ class LTSS_DB(threading.Thread):
         )
 
         # Set table name before running migrations
-        LTSS.set_table_name(self.table_name)
-        
+        self.LTSS = make_ltss_model(self.table_name)
         # Run migrations - this handles all schema setup idempotently
         migrations_ok = run_startup_migrations(
             self.engine,

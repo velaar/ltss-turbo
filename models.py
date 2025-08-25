@@ -69,7 +69,7 @@ SPECIAL_STATES = {
 class LTSS(Base):
     """Optimized state change history for time-series storage."""
 
-    __tablename__ = None # Will be set dynamically
+    __tablename__ = None  # Will be set dynamically
     
     # Primary keys - optimized for TimescaleDB partitioning
     time = Column(DateTime(timezone=True), primary_key=True, nullable=False)
@@ -99,10 +99,22 @@ class LTSS(Base):
     
     # Optional location (activated via PostGIS)
     location = None
+    
+    # Cache frequently used cleaning operations
+    _CONTROL_CHARS = str.maketrans({
+        '\x00': '\ufffd',  # NULL byte replacement
+        '\u00A0': ' ',     # Non-breaking space
+        '\u200B': '',      # Zero-width space
+        '\t': ' ',         # Tab to space
+        '\n': ' ',         # Newline to space
+        '\r': ' ',         # Carriage return to space
+    })
+    
     @classmethod
     def set_table_name(cls, table_name: str):
         """Set the table name dynamically."""
         cls.__tablename__ = table_name
+        
     @classmethod
     def activate_location_extraction(cls):
         """Enable PostGIS location support."""
@@ -117,6 +129,13 @@ class LTSS(Base):
         """
         if not raw_state or not isinstance(raw_state, str):
             return None
+            
+        # Fast path for already numeric strings (most common case)
+        if raw_state.replace('.', '').replace('-', '').isdigit():
+            try:
+                return float(raw_state)
+            except (ValueError, TypeError):
+                pass
             
         state_lower = raw_state.strip().lower()
         
@@ -166,11 +185,11 @@ class LTSS(Base):
                 return float(options.index(raw_state))
             except (ValueError, TypeError):
                 pass
+                
         # 6. Handle percentages (convert to decimal)
         if "%" in raw_state:
             # Clean and extract percentage value
-            cleaned = raw_state.replace("\u00A0", " ").replace("\u200B", "").replace("%", "").strip()
-            match = NUMERIC_EXTRACT_PATTERN.search(cleaned)
+            match = NUMERIC_EXTRACT_PATTERN.search(raw_state.replace("%", ""))
             if match:
                 try:
                     return float(match.group(0)) / 100.0
@@ -178,9 +197,7 @@ class LTSS(Base):
                     pass
         
         # 7. Extract numeric from string (last resort)
-        # Clean non-breaking spaces and zero-width spaces
-        cleaned = raw_state.replace("\u00A0", " ").replace("\u200B", "")
-        match = NUMERIC_EXTRACT_PATTERN.search(cleaned)
+        match = NUMERIC_EXTRACT_PATTERN.search(raw_state)
         if match:
             try:
                 return float(match.group(0))
@@ -193,20 +210,25 @@ class LTSS(Base):
     def from_event(cls, event) -> Optional['LTSS']:
         """Create LTSS record from Home Assistant state_changed event."""
         try:
+            # Fast extraction of required fields
             entity_id = event.data.get("entity_id")
             state = event.data.get("new_state")
             
             if not entity_id or not state:
                 return None
+                
+            # Cache commonly accessed values
+            state_str = state.state
+            attrs = state.attributes
             
             # Extract domain efficiently
             domain = entity_id.split(".", 1)[0] if "." in entity_id else "unknown"
             
-            # Get attributes safely
-            attrs = dict(state.attributes) if state.attributes else {}
+            # Only copy attributes if they exist (avoid unnecessary dict creation)
+            attrs_dict = dict(attrs) if attrs else {}
             
             # Extract metadata
-            friendly_name = attrs.get("friendly_name")
+            friendly_name = attrs_dict.get("friendly_name")
             if not friendly_name or not friendly_name.strip():
                 # Generate friendly name from entity_id
                 if "." in entity_id:
@@ -214,29 +236,29 @@ class LTSS(Base):
                 else:
                     friendly_name = entity_id
             
-            unit_of_measurement = attrs.get("unit_of_measurement")
-            device_class = attrs.get("device_class")
-            icon = attrs.get("icon")
+            unit_of_measurement = attrs_dict.get("unit_of_measurement")
+            device_class = attrs_dict.get("device_class")
+            icon = attrs_dict.get("icon")
             
             # Parse numeric state
             state_numeric = cls.parse_numeric_state(
-                state.state,
+                state_str,
                 device_class,
                 domain,
                 entity_id,
-                attrs.get("options")
+                attrs_dict.get("options")
             )
             
             # Quality flags
-            state_lower = state.state.lower() if state.state else ""
+            state_lower = state_str.lower() if state_str else ""
             is_unavailable = state_lower == "unavailable"
             is_unknown = state_lower == "unknown"
             
             # Handle location if PostGIS is enabled
             location = None
             if cls.location is not None:
-                lat = attrs.pop("latitude", None)
-                lon = attrs.pop("longitude", None)
+                lat = attrs_dict.pop("latitude", None)
+                lon = attrs_dict.pop("longitude", None)
                 
                 if lat is not None and lon is not None:
                     try:
@@ -250,16 +272,16 @@ class LTSS(Base):
             # Remove extracted fields from attributes to save space
             for key in ["friendly_name", "unit_of_measurement", "device_class", 
                        "icon", "latitude", "longitude"]:
-                attrs.pop(key, None)
+                attrs_dict.pop(key, None)
             
-            # Clean state string (remove null bytes)
-            clean_state = state.state.replace("\x00", "\ufffd") if state.state else None
+            # Clean state string using pre-compiled translation table
+            clean_state = state_str.translate(cls._CONTROL_CHARS) if state_str else None
             
             return cls(
                 entity_id=entity_id,
                 time=event.time_fired,
                 state=clean_state,
-                attributes=attrs if attrs else None,  # Don't store empty dicts
+                attributes=attrs_dict if attrs_dict else None,  # Don't store empty dicts
                 friendly_name=friendly_name,
                 unit_of_measurement=unit_of_measurement,
                 device_class=device_class,
@@ -276,52 +298,3 @@ class LTSS(Base):
         except Exception as e:
             _LOGGER.error(f"Error creating LTSS record from event: {e}", exc_info=True)
             return None
-
-
-# Optimized indexes for common query patterns
-# Primary index for entity queries (most common in Grafana)
-LTSS_entityid_time_idx = Index(
-    "ltss_entityid_time_idx", 
-    LTSS.entity_id, 
-    LTSS.time.desc()
-)
-
-# Domain queries (e.g., all sensors)
-LTSS_domain_time_idx = Index(
-    "ltss_domain_time_idx", 
-    LTSS.domain, 
-    LTSS.time.desc()
-)
-
-# Device class queries (e.g., all temperature sensors)
-LTSS_device_class_time_idx = Index(
-    "ltss_device_class_time_idx", 
-    LTSS.device_class, 
-    LTSS.time.desc(),
-    postgresql_where=LTSS.device_class.isnot(None)
-)
-
-# Numeric state queries for aggregations
-LTSS_numeric_state_idx = Index(
-    "ltss_numeric_state_idx", 
-    LTSS.entity_id, 
-    LTSS.state_numeric,
-    LTSS.time.desc(),
-    postgresql_where=LTSS.state_numeric.isnot(None)
-)
-
-# JSONB GIN index for attribute queries
-LTSS_attributes_idx = Index(
-    "ltss_attributes_idx", 
-    LTSS.attributes, 
-    postgresql_using="gin",
-    postgresql_where=LTSS.attributes.isnot(None)
-)
-
-# Quality/availability queries
-LTSS_quality_idx = Index(
-    "ltss_quality_idx",
-    LTSS.is_unavailable,
-    LTSS.is_unknown,
-    LTSS.time.desc()
-)

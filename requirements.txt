@@ -1,0 +1,12 @@
+## Requirements
+
+- Home Assistant 2023.1 or newer
+- PostgreSQL 12+ 
+- Python 3.9+
+
+### Optional PostgreSQL Extensions
+
+- **TimescaleDB** (strongly recommended for compression and hypertables)
+- **PostGIS** (optional, enables GPS/location tracking)
+
+> **Note**: LTSS Turbo works without TimescaleDB or PostGIS, but you'll get significantly better performance and compression with TimescaleDB enabled.

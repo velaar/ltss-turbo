@@ -9,8 +9,9 @@ import queue
 import threading
 import time
 import json
+import csv
 from typing import Any, Dict, Optional, Callable, List
-from io import StringIO
+from io import StringIO, BytesIO
 
 import voluptuous as vol
 from sqlalchemy import exc, create_engine, inspect, text, pool
@@ -22,6 +23,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 
 from .models import Base, LTSS
+from .migrations import run_startup_migrations
 
 from homeassistant.const import (
     ATTR_ENTITY_ID,
@@ -45,12 +47,11 @@ from homeassistant.helpers.typing import ConfigType
 import homeassistant.util.dt as dt_util
 from homeassistant.helpers.json import JSONEncoder
 
-from .models import Base, LTSS
 from .services import setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = "ltss-turbo"
+DOMAIN = "ltss"
 
 # Configuration constants
 CONF_DB_URL = "db_url"
@@ -67,11 +68,11 @@ CONF_ENABLE_LOCATION = "enable_location"
 CONF_TABLE_NAME = "table_name"
 
 CONNECT_RETRY_WAIT = 3
-DEFAULT_CHUNK_INTERVAL = 86400000000  # 1 day in microseconds (better for compression)
+DEFAULT_CHUNK_INTERVAL = 86400000000  # 1 day in microseconds (optimal for compression)
 DEFAULT_BATCH_SIZE = 500  # Larger batches for better throughput
 DEFAULT_BATCH_TIMEOUT_MS = 1000
 DEFAULT_POLL_INTERVAL_MS = 100
-DEFAULT_COMPRESSION_AFTER = 7  # Compress chunks older than 7 days
+DEFAULT_COMPRESSION_AFTER = 7  # Compress chunks older than 7 days by default
 DEFAULT_POOL_SIZE = 5
 DEFAULT_MAX_OVERFLOW = 10
 DEFAULT_TABLE_NAME = "ltss-turbo"
@@ -145,6 +146,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         max_overflow=max_overflow,
         enable_compression=enable_compression,
         enable_location=enable_location,
+        table_name=table_name,
     )
     instance.async_initialize()
     instance.start()
@@ -191,7 +193,9 @@ class LTSS_DB(threading.Thread):
         self.chunk_time_interval = chunk_time_interval
         self.async_db_ready = asyncio.Future()
         self.engine: Optional[Engine] = None
-        self.raw_connection = None  # For COPY operations
+        
+        # Reusable connection for COPY operations
+        self._copy_connection = None
 
         # Configuration
         self.batch_size = batch_size
@@ -357,29 +361,48 @@ class LTSS_DB(threading.Thread):
 
         return batch
 
+    def _get_copy_connection(self):
+        """Get or create a dedicated connection for COPY operations."""
+        if self._copy_connection is None or self._copy_connection.closed:
+            self._copy_connection = self.engine.raw_connection()
+        return self._copy_connection
+
+    def _close_copy_connection(self):
+        """Close the dedicated COPY connection."""
+        if self._copy_connection and not self._copy_connection.closed:
+            self._copy_connection.close()
+            self._copy_connection = None
+
     def _process_batch_optimized(self, batch: List) -> None:
         """Process batch using optimized COPY command for bulk insert."""
         if not batch:
             return
 
         start_time = time.time()
-        rows_data = []
+        
+        # Pre-allocate list for better memory performance
+        rows_data = [None] * len(batch)
+        valid_rows = 0
         
         # Convert events to LTSS records
-        for event in batch:
+        for i, event in enumerate(batch):
             try:
                 row = LTSS.from_event(event)
                 if row:
-                    rows_data.append(row)
+                    rows_data[valid_rows] = row
+                    valid_rows += 1
             except Exception as e:
                 _LOGGER.warning("Failed to process event: %s", e)
                 self.stats["events_dropped"] += 1
 
-        if not rows_data:
+        if valid_rows == 0:
             # Mark all events as processed even if no data was inserted
             for _ in batch:
                 self.queue.task_done()
             return
+            
+        # Trim the list to actual valid rows
+        rows_data = rows_data[:valid_rows]
 
         # Use COPY for bulk insert (much faster than individual INSERTs)
         tries = 1
@@ -391,7 +414,7 @@ class LTSS_DB(threading.Thread):
                 inserted = True
                 
                 # Update statistics
-                self.stats["events_processed"] += len(rows_data)
+                self.stats["events_processed"] += valid_rows
                 self.stats["batches_processed"] += 1
                 self.stats["last_batch_time"] = time.time()
                 
@@ -399,9 +422,9 @@ class LTSS_DB(threading.Thread):
                 _LOGGER.debug(
                     "Batch processed: %d events -> %d rows in %.2fms (%.1f rows/sec)",
                     len(batch),
-                    len(rows_data),
+                    valid_rows,
                     processing_time,
-                    len(rows_data) / (processing_time / 1000) if processing_time > 0 else 0,
+                    valid_rows / (processing_time / 1000) if processing_time > 0 else 0,
                 )
                 
             except Exception as e:
@@ -419,20 +442,23 @@ class LTSS_DB(threading.Thread):
             self.queue.task_done()
 
     def _bulk_insert_copy(self, rows: List[LTSS]) -> None:
-        """Use PostgreSQL COPY for efficient bulk insert."""
+        """Use PostgreSQL COPY for efficient bulk insert with optimized formatting."""
         if not rows:
             return
             
-        # Prepare data for COPY
+        # Use CSV writer for more efficient and safer formatting
         buffer = StringIO()
+        writer = csv.writer(buffer, delimiter='\t', quoting=csv.QUOTE_MINIMAL, 
+                           escapechar='\\', lineterminator='\n')
+            
         for row in rows:
-            # Format: time, entity_id, state, attributes, friendly_name, unit, device_class, icon, domain, state_numeric, last_changed, last_updated, is_unavailable, is_unknown
-            buffer.write("\t".join([
+            # Pre-format common values to avoid repeated operations
+            row_data = [
                 row.time.isoformat() if row.time else "\\N",
                 row.entity_id or "\\N",
-                (row.state or "").replace("\t", " ").replace("\n", " ").replace("\\", "\\\\") or "\\N",
+                row.state or "\\N",  # CSV writer handles escaping
                 json.dumps(row.attributes, cls=JSONEncoder) if row.attributes else "\\N",
-                (row.friendly_name or "").replace("\t", " ").replace("\n", " ") or "\\N",
+                row.friendly_name or "\\N",
                 row.unit_of_measurement or "\\N",
                 row.device_class or "\\N",
                 row.icon or "\\N",
@@ -440,21 +466,26 @@ class LTSS_DB(threading.Thread):
                 str(row.state_numeric) if row.state_numeric is not None else "\\N",
                 row.last_changed.isoformat() if row.last_changed else "\\N",
                 row.last_updated.isoformat() if row.last_updated else "\\N",
-                "t" if row.is_unavailable else "f",
-                "t" if row.is_unknown else "f",
-            ]))
+                "true" if row.is_unavailable else "false",
+                "true" if row.is_unknown else "false",
+            ]
             
             # Add location if enabled
-            if LTSS.location is not None and hasattr(row, 'location') and row.location:
-                buffer.write(f"\t{row.location}")
+            if LTSS.location is not None:
+                if hasattr(row, 'location') and row.location:
+                    row_data.append(row.location)
+                else:
+                    row_data.append("\\N")
             
-            buffer.write("\n")
+            writer.writerow(row_data)
         
         buffer.seek(0)
         
-        # Use raw connection for COPY
-        with self.engine.raw_connection() as conn:
+        # Use dedicated connection for COPY operations (reuses connection)
+        conn = self._get_copy_connection()
+        try:
             with conn.cursor() as cursor:
+                # Define columns once
                 columns = [
                     "time", "entity_id", "state", "attributes", "friendly_name",
                     "unit_of_measurement", "device_class", "icon", "domain",
@@ -467,13 +498,19 @@ class LTSS_DB(threading.Thread):
                 
                 cursor.copy_from(
                     buffer,
-                    LTSS.__tablename__,
                     self.table_name,
                     columns=columns,
-                    null="\\N",
+                    null="\\N", 
                     sep="\t"
                 )
             conn.commit()
+        except Exception as e:
+            conn.rollback()
+            # Force reconnection on error
+            self._close_copy_connection()
+            raise e
+        finally:
+            buffer.close()
 
     @callback
     def event_listener(self, event):
@@ -493,7 +530,7 @@ class LTSS_DB(threading.Thread):
                     self.stats["events_dropped"] += 1
 
     def _setup_connection(self):
-        """Set up database connection with all optimizations."""
+        """Set up database connection using migration system."""
         if self.engine is not None:
             self.engine.dispose()
 
@@ -509,162 +546,39 @@ class LTSS_DB(threading.Thread):
             json_serializer=lambda obj: json.dumps(obj, cls=JSONEncoder),
         )
 
-        inspector = inspect(self.engine)
-
-        with self.engine.connect() as con:
-            con = con.execution_options(isolation_level="AUTOCOMMIT")
-            
-            # Check available extensions
-            available_extensions = {}
-            try:
-                result = con.execute(
-                    text("SELECT name, installed_version FROM pg_available_extensions")
-                )
-                available_extensions = {
-                    row.name: row.installed_version for row in result
-                }
-            except Exception as e:
-                _LOGGER.warning("Could not query PostgreSQL extensions: %s", e)
-
-            # Enable PostGIS if requested and available
-            if self.enable_location and "postgis" in available_extensions:
-                _LOGGER.info("Enabling PostGIS location support...")
-                con.execute(text("CREATE EXTENSION IF NOT EXISTS postgis CASCADE"))
-                LTSS.activate_location_extraction()
-
-            # Create table if it doesn't exist
-            if not inspector.has_table(LTSS.__tablename__):
-                self._create_table(available_extensions)
-            else:
-                _LOGGER.info("LTSS Turbo Table '%s' found", self.table_name)
-
-            # Set up TimescaleDB optimizations
-            if "timescaledb" in available_extensions:
-                self._setup_timescaledb(con)
-
-            # Create indexes for the table
-            from .models import create_ltss_indexes
-            create_ltss_indexes(self.table_name)
-
+        # Set table name before running migrations
+        LTSS.set_table_name(self.table_name)
+        
+        # Run migrations - this handles all schema setup idempotently
+        migrations_ok = run_startup_migrations(
+            self.engine,
+            self.table_name,
+            enable_timescale=True,  # Always try to enable if available
+            enable_compression=self.enable_compression,
+            enable_location=self.enable_location,
+            chunk_time_interval=self.chunk_time_interval,
+            compression_after=self.compression_after,
+            retention_days=self.retention_days
+        )
+        
+        if not migrations_ok:
+            raise Exception("Failed to run database migrations")
+        
+        # Set up session factory
         self.get_session = scoped_session(sessionmaker(bind=self.engine))
         
-        # Log final configuration
         _LOGGER.info(
-            "LTSS Turbo initialized: TimescaleDB=%s, PostGIS=%s, Compression=%s",
-            "timescaledb" in available_extensions,
-            self.enable_location and "postgis" in available_extensions,
-            self.enable_compression and "timescaledb" in available_extensions,
+            "LTSS Turbo initialized: table=%s, compression=%s after %d days",
+            self.table_name,
+            "enabled" if self.enable_compression else "disabled",
+            self.compression_after
         )
-
-    def _create_table(self, available_extensions: Dict[str, Any]):
-        """Create LTSS table with all indexes."""
-        _LOGGER.info("Creating LTSS table...")
-        
-        with self.engine.connect() as con:
-            con = con.execution_options(isolation_level="AUTOCOMMIT")
-            
-            # Create table
-            Base.metadata.create_all(self.engine)
-            
-            # Set up TimescaleDB if available
-            if "timescaledb" in available_extensions:
-                _LOGGER.info("Creating TimescaleDB hypertable...")
-                con.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE"))
-                
-                # Create hypertable
-                con.execute(
-                    text(
-                        f"""SELECT create_hypertable(
-                            '{self.table_name}',
-                            'time',
-                            chunk_time_interval => INTERVAL '{self.chunk_time_interval // 1000000} seconds',
-                            if_not_exists => TRUE
-                        );"""
-                    )
-                )
-                
-                _LOGGER.info("Hypertable created successfully")
-
-    def _setup_timescaledb(self, con):
-        """Configure TimescaleDB optimizations."""
-        try:
-            # Update chunk time interval
-            con.execute(
-                text(
-                    f"""SELECT set_chunk_time_interval(
-                        '{self.table_name}',
-                        INTERVAL '{self.chunk_time_interval // 1000000} seconds'
-                    );"""
-                )
-            )
-            _LOGGER.info(
-                "TimescaleDB chunk interval set to %d seconds",
-                self.chunk_time_interval // 1000000
-            )
-            
-            # Set up compression if enabled
-            if self.enable_compression:
-                self._setup_compression(con)
-            
-            # Set up retention policy if configured
-            if self.retention_days:
-                self._setup_retention_policy(con)
-                
-        except Exception as e:
-            _LOGGER.warning("TimescaleDB setup partially failed: %s", e)
-
-    def _setup_compression(self, con):
-        """Enable TimescaleDB compression for older chunks."""
-        try:
-            # Enable compression on the hypertable
-            con.execute(
-                text(
-                    f"""ALTER TABLE {self.table_name} SET (
-                        timescaledb.compress,
-                        timescaledb.compress_segmentby = 'entity_id',
-                        timescaledb.compress_orderby = 'time DESC',
-                        timescaledb.compress_chunk_time_interval = INTERVAL '{self.chunk_time_interval // 1000000} seconds'
-                    );"""
-                )
-            )
-            
-            # Add compression policy
-            con.execute(
-                text(
-                    f"""SELECT add_compression_policy(
-                        '{self.table_name}',
-                        INTERVAL '{self.compression_after} days',
-                        if_not_exists => TRUE
-                    );"""
-                )
-            )
-            
-            _LOGGER.info(
-                "TimescaleDB compression enabled (compress after %d days)",
-                self.compression_after
-            )
-            
-        except Exception as e:
-            _LOGGER.warning("Could not enable compression: %s", e)
-
-    def _setup_retention_policy(self, con):
-        """Set up automatic data retention policy."""
-        try:
-            con.execute(
-                text(
-                    f"""SELECT add_retention_policy(
-                        '{self.table_name}',
-                        INTERVAL '{self.retention_days} days',
-                        if_not_exists => TRUE
-                    );"""
-                )
-            )
-            _LOGGER.info("Retention policy set to %d days", self.retention_days)
-        except Exception as e:
-            _LOGGER.warning("Could not set retention policy: %s", e)
 
     def _close_connection(self):
         """Close database connections cleanly."""
+        # Close dedicated COPY connection
+        self._close_copy_connection()
+        
         if self.get_session:
             self.get_session.remove()
             self.get_session = None

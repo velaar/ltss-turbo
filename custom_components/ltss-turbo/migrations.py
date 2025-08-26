@@ -111,7 +111,11 @@ class MetadataManager:
     def get_schema_version(self) -> Optional[int]:
         """Get current schema version."""
         version_str = self.get("schema_version")
-        return int(version_str) if version_str else None
+        try:
+            return int(version_str) if version_str else None
+        except (ValueError, TypeError) as e:
+            _LOGGER.warning(f"Invalid schema version '{version_str}': {e}")
+            return None
     
     def set_schema_version(self, version: int):
         """Set schema version."""
@@ -190,18 +194,29 @@ def run_startup_migrations(
                     metadata_mgr.set_schema_version(current_version)
                 else:
                     metadata_mgr.table_created = True  # Table exists, mark as available
+                    # Re-read current version now that we know the table exists
+                    current_version = metadata_mgr.get_schema_version()
                 
                 # Update startup info for existing installations
                 metadata_mgr.set("last_startup", datetime.utcnow().isoformat())
                 metadata_mgr.set("enable_timescale", str(enable_timescale))
                 metadata_mgr.set("enable_compression", str(enable_compression))
             
+            # CRITICAL FIX: Handle None current_version
+            if current_version is None:
+                _LOGGER.warning("Schema version not found in metadata, treating as version 0")
+                current_version = 0
+                # Set it in the database for future reference
+                metadata_mgr.set_schema_version(current_version)
+            
+            _LOGGER.info(f"Current schema version: {current_version}")
+            
             # Run any pending migrations
             migrations_run = 0
             total_migration_time = 0
             
             for version in sorted(MIGRATIONS.keys()):
-                if version > current_version:
+                if version > current_version:  # Now safe since current_version is guaranteed to be int
                     _LOGGER.info(f"Running migration v{version}: {MIGRATIONS[version].__doc__}")
                     
                     start_time = time.time()

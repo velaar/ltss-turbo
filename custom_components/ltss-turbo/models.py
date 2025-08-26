@@ -1,4 +1,4 @@
-"""Optimized models.py with high-performance state parsing and mandatory location support."""
+"""Optimized models.py with high-performance state parsing and optional location support."""
 
 import re
 import json
@@ -10,10 +10,12 @@ import threading
 
 from sqlalchemy import Column, DateTime, String, Float, Boolean
 from sqlalchemy.dialects.postgresql import JSONB
-from geoalchemy2 import Geometry
 from sqlalchemy.orm import declarative_base, mapped_column, Mapped
+from geoalchemy2 import Geometry
+
 
 _LOGGER = logging.getLogger(__name__)
+
 Base = declarative_base()
 
 class OptimizedStateParser:
@@ -306,7 +308,7 @@ class StringInternPool:
 
 
 def make_ltss_model(table_name: str = "ltss_turbo"):
-    """Create optimized LTSS model with mandatory location support."""
+    """Create optimized LTSS model with optional location support."""
     
     # Remove stale table from metadata
     if table_name in Base.metadata.tables:
@@ -346,20 +348,19 @@ def make_ltss_model(table_name: str = "ltss_turbo"):
         is_unavailable = Column(Boolean, default=False, nullable=False)
         is_unknown = Column(Boolean, default=False, nullable=False)
         
-        # PostGIS location - now mandatory
-        location = Column(Geometry("POINT", srid=4326), nullable=True)  # Nullable for entities without coordinates
+        location = Column(Geometry("POINT", srid=4326), nullable=True)
         
         @classmethod
         def from_event(cls, event) -> Optional['LTSS']:
             """
-            Highly optimized event-to-record conversion with mandatory location support.
+            Highly optimized event-to-record conversion with optional location support.
             
             Key optimizations:
             - Single-pass attribute processing
             - String interning for common values  
             - Cached domain extraction
             - Optimized state parsing with caching
-            - Mandatory location processing (always attempted)
+            - Location processing (when available)
             """
             try:
                 # Fast field extraction
@@ -426,7 +427,7 @@ def make_ltss_model(table_name: str = "ltss_turbo"):
                     state_str, device_class, domain, entity_id, options
                 )
                 
-                # Location processing - now always attempted (mandatory support)
+                # Location processing - depends on PostGIS availability
                 location = None
                 if lat is not None and lon is not None:
                     try:

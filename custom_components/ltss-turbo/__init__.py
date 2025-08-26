@@ -8,9 +8,10 @@ import io
 import json
 import logging
 import queue
+import struct
 import threading
 import time
-from io import StringIO
+import csv
 from typing import Any, Callable, Iterable, List, Optional
 
 # Third-party libraries
@@ -159,6 +160,7 @@ class BinaryRowEncoder:
     def __init__(self):
         # Pre-compiled format strings for common types
         self._header_format = struct.Struct('>11sii')  # signature, flags, header extension
+        self._int16_format = struct.Struct('>h')
         self._int32_format = struct.Struct('>i')
         self._int64_format = struct.Struct('>q') 
         self._float64_format = struct.Struct('>d')
@@ -233,13 +235,65 @@ class BinaryRowEncoder:
             
         elif field_type == 'geometry':
             if value:
-                # For PostGIS EWKB format - simplified for text-based WKT
-                wkt_data = self._encode_string(str(value))
-                buffer.write(self._int32_format.pack(len(wkt_data)))
-                buffer.write(wkt_data)
+                ewkb = self._encode_point_ewkb(str(value))
+               # COPY binary requires a 4-byte length prefix for every field
+                buffer.write(self._int32_format.pack(len(ewkb)))
+                buffer.write(ewkb)
             else:
-                buffer.write(self._int32_format.pack(-1))  # NULL
-    
+                # NULL is always -1 encoded as a 4-byte signed int
+                buffer.write(self._int32_format.pack(-1))
+
+    def _encode_point_ewkb(self, value: str) -> bytes:
+        """
+        Accepts 'SRID=4326;POINT(lon lat)' or 'POINT(lon lat)'
+        Returns little-endian EWKB bytes with SRID flag (2D point).
+        """
+        # Defaults
+        srid = 4326
+        txt = value.strip()
+
+        # Split optional SRID
+        if txt.upper().startswith("SRID="):
+            head, _, rest = txt.partition(";")
+            try:
+                srid = int(head.split("=", 1)[1])
+            except Exception:
+                srid = 4326
+            wkt = rest
+        else:
+            wkt = txt
+
+        # Extract lon/lat from WKT
+        start = wkt.find("(")
+        end = wkt.find(")", start + 1)
+        if start == -1 or end == -1:
+            raise ValueError(f"Invalid WKT for POINT: {value}")
+        parts = wkt[start + 1 : end].strip().split()
+        if len(parts) != 2:
+            raise ValueError(f"Expected 'lon lat' in POINT: {value}")
+
+        lon = float(parts[0])
+        lat = float(parts[1])
+
+        # EWKB (little-endian):
+        # 1 byte: endian (1 = little)
+        # 4 bytes: type (base 1 = Point, with SRID flag 0x20000000)
+        # 4 bytes: SRID (uint32)
+        # 8 bytes: X (float64)
+        # 8 bytes: Y (float64)
+        endian = 1
+        WKB_POINT = 1
+        EWKB_SRID_FLAG = 0x20000000
+        type_with_srid = WKB_POINT | EWKB_SRID_FLAG
+
+        return (
+            struct.pack("<B", endian)
+            + struct.pack("<I", type_with_srid)
+            + struct.pack("<I", srid)
+            + struct.pack("<d", lon)
+            + struct.pack("<d", lat)
+        )
+
     def encode_rows(self, rows: List[Any]) -> bytes:
         """Encode multiple rows in binary format."""
         if not rows:
@@ -248,9 +302,7 @@ class BinaryRowEncoder:
         buffer = io.BytesIO()
         
         # PostgreSQL binary format header
-        buffer.write(b'PGCOPY\n\xff\r\n\x00')  # Signature
-        buffer.write(self._int32_format.pack(0))    # Flags
-        buffer.write(self._int32_format.pack(0))    # Header extension
+        buffer.write(self._header_format.pack(b'PGCOPY\n\xff\r\n\x00', 0, 0))
         
         # Field definitions (column types in order) 
         field_types = [
@@ -276,7 +328,7 @@ class BinaryRowEncoder:
         # Encode each row
         for row in rows:
             # Field count
-            buffer.write(self._int32_format.pack(column_count))
+            buffer.write(self._int16_format.pack(column_count))
             
             # Field values 
             row_values = [
@@ -302,13 +354,13 @@ class BinaryRowEncoder:
                 self._write_field(buffer, value, field_type)
         
         # EOF marker
-        buffer.write(self._int32_format.pack(-1))
-        
+        buffer.write(self._int16_format.pack(-1))
+
         return buffer.getvalue()
 
 
 class ConnectionManager:
-    """Enhanced connection management optimized for use with pgbouncer."""
+    """Enhanced connection management for use with pgbouncer."""
     
     def __init__(self, engine):
         self.engine = engine
@@ -323,7 +375,7 @@ class ConnectionManager:
         }
     
     def get_copy_connection(self):
-        """Get or create optimized connection for COPY operations."""
+        """Get or create connection for COPY operations."""
         with self._connection_lock:
             # Reuse existing connection if still valid
             if self._copy_connection and not self._copy_connection.closed:
@@ -333,23 +385,19 @@ class ConnectionManager:
             # Create new connection
             try:
                 self._copy_connection = self.engine.raw_connection()
-                # Set optimal settings for bulk operations
-                with self._copy_connection.cursor() as cur:
-                    # Optimize for bulk operations
-                    # Note: These settings work with both direct PostgreSQL and pgbouncer
-                    try:
+
+                try:
+                    with self._copy_connection.cursor() as cur:
+                        # Safe, session-settable toggles
                         cur.execute("SET synchronous_commit = OFF")
-                        cur.execute("SET statement_timeout = 30000")  # Set after connection
-                    except Exception as e:
-                        # Some settings might not be available through pgbouncer
-                        _LOGGER.debug(f"Could not set all connection optimizations: {e}")
-                    
-                    # These are more likely to work with pgbouncer
+                        cur.execute("SET statement_timeout = 30000")
+                except Exception as e:
+                    # Ensure we clear any aborted txn before reuse
                     try:
-                        cur.execute("SET wal_buffers = '64MB'")
-                        cur.execute("SET checkpoint_completion_target = 0.9")
-                    except Exception as e:
-                        _LOGGER.debug(f"Could not set WAL optimizations: {e}")
+                        self._copy_connection.rollback()
+                    except Exception:
+                        pass
+                    _LOGGER.debug(f"Connection tuning skipped: {e}")
                         
                 return self._copy_connection
                 
@@ -536,6 +584,9 @@ class LTSS_DB(threading.Thread):
             # Process normal batch
             self._process_batch(batch)
 
+
+
+
     def _collect_batch(self) -> List:
         """Collect events into batch with timeout."""
         batch = []
@@ -579,7 +630,7 @@ class LTSS_DB(threading.Thread):
             self._copy_connection = None
 
     def _process_batch(self, batch: List) -> None:
-        """Optimized batch processing using binary COPY format."""
+        """Batch processing using binary COPY format."""
         if not batch:
             return
 
@@ -646,6 +697,9 @@ class LTSS_DB(threading.Thread):
         for _ in batch:
             self.queue.task_done()
 
+
+
+
     def _bulk_insert(self, rows: List[Any]) -> None:
         """
         High-performance binary COPY implementation.
@@ -653,53 +707,39 @@ class LTSS_DB(threading.Thread):
         """
         if not rows:
             return
-
         try:
-            # Encode to binary format
             binary_data = self._binary_encoder.encode_rows(rows)
-            
-            # Get optimized connection
             conn = self._conn_manager.get_copy_connection()
-            
-            # All columns including mandatory location
             columns = [
-                "time", "entity_id", "state", "attributes",
-                "friendly_name", "unit_of_measurement", "device_class", "icon",
-                "domain", "state_numeric", "last_changed", "last_updated",
-                "is_unavailable", "is_unknown", "location"
-            ]
-
+                    "time", "entity_id", "state", "attributes",
+                    "friendly_name", "unit_of_measurement", "device_class", "icon",
+                    "domain", "state_numeric", "last_changed", "last_updated",
+                    "is_unavailable", "is_unknown", "location"
+                ]
             cols_sql = ", ".join(columns)
             copy_sql = f"COPY {self.table_name} ({cols_sql}) FROM STDIN WITH (FORMAT binary)"
-
             with conn.cursor() as cur:
                 cur.copy_expert(copy_sql, io.BytesIO(binary_data))
             conn.commit()
-            
-            # Update connection stats
             self._conn_manager.stats["copy_operations"] += 1
-            
-            _LOGGER.debug(f"Binary COPY inserted {len(rows)} rows successfully")
-            
+            _LOGGER.debug("Binary COPY inserted %d rows successfully", len(rows))
+            return
         except Exception as e:
-            _LOGGER.error(f"Binary COPY operation failed: {e}")
-            
-            # Enhanced error logging for binary format debugging
-            if "invalid input syntax" in str(e):
-                _LOGGER.error(f"Binary format error - check data encoding for batch of {len(rows)} rows")
-                # Log sample data for debugging
-                if rows:
-                    sample = rows[0]
-                    _LOGGER.error(f"Sample row data: entity_id={getattr(sample, 'entity_id', 'N/A')}, "
-                                f"state={getattr(sample, 'state', 'N/A')}")
-            
+            _LOGGER.error("Binary COPY failed: %s -- falling back to text COPY", e)
             try:
-                conn.rollback()
-            except:
-                pass
-            finally:
-                self._conn_manager.close_copy_connection()
-            raise
+                self._bulk_insert_text(rows)
+                _LOGGER.debug("Text COPY inserted %d rows successfully", len(rows))
+                return
+            except Exception as e2:
+                _LOGGER.error("Text COPY also failed: %s", e2)
+                # rollback/close like you already do
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                finally:
+                    self._conn_manager.close_copy_connection()
+                raise
 
 
     @callback
@@ -778,8 +818,6 @@ class LTSS_DB(threading.Thread):
             # Connection-level optimizations (pgbouncer compatible)
             connect_args=connect_args,
             
-            # Performance settings
-            isolation_level="READ_COMMITTED",
             json_serializer=lambda obj: json.dumps(obj, cls=JSONEncoder, separators=(',', ':')),
         )
 
@@ -807,7 +845,7 @@ class LTSS_DB(threading.Thread):
         self.get_session = scoped_session(sessionmaker(bind=self.engine))
         
         _LOGGER.info(
-            "LTSS Turbo optimized connection initialized: table=%s, compression=%s, pgbouncer_mode=%s",
+            "LTSS Turbo connection initialized: table=%s, compression=%s, pgbouncer_mode=%s",
             self.table_name,
             "enabled" if self.enable_compression else "disabled",
             "detected" if self._detect_pgbouncer(self.db_url) else "direct"
@@ -815,7 +853,7 @@ class LTSS_DB(threading.Thread):
 
 
     def _close_connection(self):
-        # Close optimized connection manager
+        # Close connection manager
         if hasattr(self, '_conn_manager'):
             self._conn_manager.close_copy_connection()
             _LOGGER.info("Connection manager stats: %s", self._conn_manager.get_stats())
@@ -828,4 +866,47 @@ class LTSS_DB(threading.Thread):
             self.engine.dispose()
             self.engine = None
             
-        _LOGGER.info("Optimized database connections closed")
+        _LOGGER.info("Database connections closed")
+
+
+    def _rows_to_csv_lines(self, rows):
+         # Build CSV lines with proper quoting; use EWKT for geometry and JSON text for jsonb
+
+        buf = io.StringIO()
+        w = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+        for r in rows:
+            line = [
+                getattr(r, "time", None),                       # timestamptz -> ISO is fine for text COPY
+                getattr(r, "entity_id", None),
+                getattr(r, "state", None),
+                json.dumps(getattr(r, "attributes", None), separators=(",", ":"), ensure_ascii=False) 
+                    if getattr(r, "attributes", None) is not None else None,  # jsonb <- JSON TEXT
+                getattr(r, "friendly_name", None),
+                getattr(r, "unit_of_measurement", None),
+                getattr(r, "device_class", None),
+                getattr(r, "icon", None),
+                getattr(r, "domain", None),
+                getattr(r, "state_numeric", None),
+                getattr(r, "last_changed", None),
+                getattr(r, "last_updated", None),
+                bool(getattr(r, "is_unavailable", False)),
+                bool(getattr(r, "is_unknown", False)),
+                getattr(r, "location", None),  # EWKT like 'SRID=4326;POINT(lon lat)' works in text COPY
+            ]
+            # csv.writer writes into buf; fetch line
+            w.writerow([ "" if v is None else v for v in line ])
+        return buf.getvalue()
+
+    def _bulk_insert_text(self, rows):
+        if not rows:
+            return
+        conn = self._conn_manager.get_copy_connection()
+        cols = ["time","entity_id","state","attributes","friendly_name","unit_of_measurement",
+                "device_class","icon","domain","state_numeric","last_changed","last_updated",
+                "is_unavailable","is_unknown","location"]
+        cols_sql = ", ".join(cols)
+        copy_sql = f"COPY {self.table_name} ({cols_sql}) FROM STDIN WITH (FORMAT csv, HEADER false)"
+        csv_payload = self._rows_to_csv_lines(rows)
+        with conn.cursor() as cur:
+            cur.copy_expert(copy_sql, io.StringIO(csv_payload))
+        conn.commit()

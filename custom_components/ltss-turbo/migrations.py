@@ -1,4 +1,4 @@
-"""Database migrations for LTSS Turbo with metadata table for version tracking."""
+"""Database migrations for LTSS Turbo with proper transaction management."""
 
 import logging
 from typing import Optional, Dict, Any, Callable
@@ -26,16 +26,20 @@ def migration(version: int):
 
 
 class MetadataManager:
-    """Manager for schema metadata and version tracking."""
+    """Manager for schema metadata and version tracking with proper transaction handling."""
     
     def __init__(self, conn, table_name: str):
         self.conn = conn
         self.meta_table = f"{table_name}_meta"
-        self._ensure_table()
+        self.table_created = False
     
-    def _ensure_table(self):
-        """Create metadata table if it doesn't exist."""
+    def ensure_table_in_transaction(self):
+        """Create metadata table within the current transaction context."""
+        if self.table_created:
+            return
+            
         try:
+            # Create table in current transaction
             self.conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS {self.meta_table} (
                     key VARCHAR(50) PRIMARY KEY,
@@ -50,13 +54,17 @@ class MetadataManager:
                 ON {self.meta_table}(updated_at DESC)
             """))
             
-            _LOGGER.debug(f"Metadata table {self.meta_table} ensured")
+            self.table_created = True
+            _LOGGER.debug(f"Metadata table {self.meta_table} ensured in transaction")
         except Exception as e:
-            _LOGGER.error(f"Failed to create metadata table: {e}")
+            _LOGGER.error(f"Failed to create metadata table in transaction: {e}")
             raise
     
     def get(self, key: str, default: Any = None) -> Optional[str]:
         """Get metadata value by key."""
+        if not self.table_created:
+            return default
+            
         try:
             result = self.conn.execute(text(f"""
                 SELECT value FROM {self.meta_table} WHERE key = :key
@@ -68,7 +76,10 @@ class MetadataManager:
             return default
     
     def set(self, key: str, value: Any):
-        """Set metadata value."""
+        """Set metadata value within current transaction."""
+        if not self.table_created:
+            self.ensure_table_in_transaction()
+            
         try:
             self.conn.execute(text(f"""
                 INSERT INTO {self.meta_table} (key, value, updated_at)
@@ -84,6 +95,9 @@ class MetadataManager:
     
     def get_all(self) -> Dict[str, str]:
         """Get all metadata."""
+        if not self.table_created:
+            return {}
+            
         try:
             result = self.conn.execute(text(f"""
                 SELECT key, value FROM {self.meta_table}
@@ -119,29 +133,38 @@ def run_startup_migrations(
     retention_days: Optional[int] = None
 ) -> bool:
     """
-    Run all necessary migrations with comprehensive version tracking.
+    Run all necessary migrations with proper transaction management.
     
     Returns True if successful, False otherwise.
     """
     try:
-        with engine.connect() as conn:
-            # Initialize metadata manager
+        # Use a single transaction for all migration operations
+        with engine.begin() as conn:  # Use .begin() for automatic transaction management
+            _LOGGER.info("Starting LTSS Turbo migration system...")
+            
+            # Initialize metadata manager (doesn't create table yet)
             metadata_mgr = MetadataManager(conn, table_name)
             
-            # Get current schema version
+            # Check if this is a fresh install or existing installation
+            inspector = inspect(engine)
+            is_fresh_install = not inspector.has_table(table_name)
+            
+            # Get current schema version (this will be None if meta table doesn't exist)
             current_version = metadata_mgr.get_schema_version()
             
-            # Record startup info
-            metadata_mgr.set("last_startup", datetime.utcnow().isoformat())
-            metadata_mgr.set("enable_timescale", str(enable_timescale))
-            metadata_mgr.set("enable_compression", str(enable_compression))
-            metadata_mgr.set("chunk_time_interval", str(chunk_time_interval))
-            metadata_mgr.set("compression_after_days", str(compression_after))
-            metadata_mgr.set("retention_days", str(retention_days) if retention_days else "unlimited")
-            
-            if current_version is None:
-                # Fresh install - run initial setup
+            if is_fresh_install:
                 _LOGGER.info("Fresh LTSS Turbo installation detected, running initial setup...")
+                
+                # Ensure metadata table exists before recording anything
+                metadata_mgr.ensure_table_in_transaction()
+                
+                # Record startup info
+                metadata_mgr.set("last_startup", datetime.utcnow().isoformat())
+                metadata_mgr.set("enable_timescale", str(enable_timescale))
+                metadata_mgr.set("enable_compression", str(enable_compression))
+                metadata_mgr.set("chunk_time_interval", str(chunk_time_interval))
+                metadata_mgr.set("compression_after_days", str(compression_after))
+                metadata_mgr.set("retention_days", str(retention_days) if retention_days else "unlimited")
                 
                 start_time = time.time()
                 success = _run_initial_setup(conn, engine, table_name, enable_timescale, 
@@ -149,14 +172,29 @@ def run_startup_migrations(
                 duration_ms = (time.time() - start_time) * 1000
                 
                 if not success:
-                    _LOGGER.error("Initial setup failed")
-                    return False
+                    _LOGGER.error("Initial setup failed, rolling back transaction")
+                    raise Exception("Initial setup failed")
                 
                 metadata_mgr.set_schema_version(0)
                 metadata_mgr.record_migration_time(0, duration_ms)
                 current_version = 0
                 
                 _LOGGER.info(f"Initial setup completed in {duration_ms:.1f}ms")
+            else:
+                # Existing installation - check if meta table exists
+                if not inspector.has_table(f"{table_name}_meta"):
+                    _LOGGER.warning("Existing installation detected but metadata table missing - creating...")
+                    metadata_mgr.ensure_table_in_transaction()
+                    # Set current version to 0 since we don't know what migrations were run
+                    current_version = 0
+                    metadata_mgr.set_schema_version(current_version)
+                else:
+                    metadata_mgr.table_created = True  # Table exists, mark as available
+                
+                # Update startup info for existing installations
+                metadata_mgr.set("last_startup", datetime.utcnow().isoformat())
+                metadata_mgr.set("enable_timescale", str(enable_timescale))
+                metadata_mgr.set("enable_compression", str(enable_compression))
             
             # Run any pending migrations
             migrations_run = 0
@@ -182,7 +220,7 @@ def run_startup_migrations(
                     except Exception as e:
                         _LOGGER.error(f"Migration v{version} failed: {e}", exc_info=True)
                         metadata_mgr.set(f"migration_v{version}_error", str(e))
-                        return False
+                        raise  # Re-raise to trigger rollback
             
             if migrations_run > 0:
                 _LOGGER.info(
@@ -192,19 +230,33 @@ def run_startup_migrations(
             else:
                 _LOGGER.debug(f"Schema up-to-date at v{current_version}, no migrations needed")
             
-            # Apply runtime configurations
-            if enable_timescale:
-                _configure_timescaledb_policies(conn, table_name, enable_compression,
-                                              compression_after, retention_days, metadata_mgr)
+            # Apply runtime configurations (outside main table transaction)
+            # These are handled separately as they might fail without breaking the core setup
             
-            # Log final metadata state
-            all_metadata = metadata_mgr.get_all()
-            _LOGGER.debug(f"Metadata state: {all_metadata}")
-            
-            return True
+        # Apply TimescaleDB policies in a separate transaction to avoid rollback issues
+        if enable_timescale:
+            try:
+                with engine.begin() as policy_conn:
+                    # Re-initialize metadata manager for policy configuration
+                    policy_metadata = MetadataManager(policy_conn, table_name)
+                    policy_metadata.table_created = True  # We know it exists now
+                    _configure_timescaledb_policies(policy_conn, table_name, enable_compression,
+                                                  compression_after, retention_days, policy_metadata)
+            except Exception as e:
+                _LOGGER.warning(f"TimescaleDB policy configuration failed (non-critical): {e}")
+        
+        # Final success logging
+        with engine.connect() as final_conn:
+            final_metadata = MetadataManager(final_conn, table_name)
+            final_metadata.table_created = True
+            all_metadata = final_metadata.get_all()
+            _LOGGER.debug(f"Final metadata state: {all_metadata}")
+        
+        _LOGGER.info("LTSS Turbo migration system completed successfully")
+        return True
             
     except Exception as e:
-        _LOGGER.error(f"Migration system error: {e}", exc_info=True)
+        _LOGGER.error(f"Migration system failed: {e}", exc_info=True)
         return False
 
 
@@ -216,11 +268,9 @@ def _run_initial_setup(
     chunk_time_interval: int,
     metadata_mgr: 'MetadataManager'
 ) -> bool:
-    """Run initial setup with enhanced error handling and metadata tracking."""
+    """Run initial setup with proper transaction handling."""
     
     try:
-        inspector = inspect(engine)
-        
         # Check for available extensions
         extensions = _get_available_extensions(conn)
         metadata_mgr.set("available_extensions", ",".join(sorted(extensions)))
@@ -272,60 +322,36 @@ def _run_initial_setup(
             from .models import Base, make_ltss_model
             Model = make_ltss_model(table_name)
             
-            # Create table if missing
-            if not inspector.has_table(table_name):
-                _LOGGER.info(f"Creating table '{table_name}'...")
-                
-                # Create the table
-                Base.metadata.create_all(engine, tables=[Base.metadata.tables[table_name]])
+            # Create table
+            _LOGGER.info(f"Creating table '{table_name}'...")
+            Base.metadata.create_all(engine, tables=[Base.metadata.tables[table_name]])
 
-                # Verify table creation
-                inspector = inspect(engine)
-                if not inspector.has_table(table_name):
-                    raise RuntimeError(f"Failed to create table '{table_name}'")
-                    
-                columns = [col['name'] for col in inspector.get_columns(table_name)]
-                metadata_mgr.set("table_columns", ",".join(sorted(columns)))
-                _LOGGER.info(f"Table '{table_name}' created with columns: {sorted(columns)}")
+            # Verify table creation within the same transaction
+            inspector = inspect(engine)
+            if not inspector.has_table(table_name):
+                raise RuntimeError(f"Failed to create table '{table_name}'")
                 
-                # Check if location column exists
-                if 'location' in columns:
-                    metadata_mgr.set("location_column", "true")
-                    _LOGGER.info("Location column created successfully")
-                else:
-                    metadata_mgr.set("location_column", "false")
-                    _LOGGER.warning("Location column not created - PostGIS may not be available")
-                    
+            columns = [col['name'] for col in inspector.get_columns(table_name)]
+            metadata_mgr.set("table_columns", ",".join(sorted(columns)))
+            _LOGGER.info(f"Table '{table_name}' created with columns: {sorted(columns)}")
+            
+            # Check if location column exists
+            if 'location' in columns:
+                metadata_mgr.set("location_column", "true")
+                _LOGGER.info("Location column created successfully")
             else:
-                _LOGGER.info(f"Table '{table_name}' already exists")
-                
-                # For existing tables, check columns
-                columns = [col['name'] for col in inspector.get_columns(table_name)]
-                metadata_mgr.set("table_columns", ",".join(sorted(columns)))
-                
-                # Try to add location column if missing and PostGIS is available
-                if 'location' not in columns and postgis_available:
-                    _LOGGER.info("Adding location column to existing table...")
-                    try:
-                        conn.execute(text(f"""
-                            ALTER TABLE {table_name} 
-                            ADD COLUMN location GEOMETRY(POINT, 4326)
-                        """))
-                        metadata_mgr.set("location_column", "added")
-                        _LOGGER.info("Location column added successfully")
-                    except Exception as e:
-                        metadata_mgr.set("location_column", "failed")
-                        _LOGGER.warning(f"Could not add location column: {e}")
+                metadata_mgr.set("location_column", "false")
+                _LOGGER.warning("Location column not created - PostGIS may not be available")
 
         except Exception as e:
-            _LOGGER.error(f"Failed to create/update table: {e}")
+            _LOGGER.error(f"Failed to create table: {e}")
             metadata_mgr.set("table_creation_error", str(e))
-            return False
+            raise
 
         # Convert to hypertable if TimescaleDB is available
         if timescaledb_available:
             try:
-                # Check if already a hypertable
+                # Check if already a hypertable (shouldn't be for new table, but safety check)
                 result = conn.execute(text(f"""
                     SELECT COUNT(*) as count 
                     FROM timescaledb_information.hypertables 
@@ -339,7 +365,7 @@ def _run_initial_setup(
                             'time',
                             chunk_time_interval => INTERVAL '{chunk_time_interval // 1_000_000} seconds',
                             if_not_exists => TRUE,
-                            migrate_data => TRUE
+                            migrate_data => FALSE
                         )
                     """))
                     metadata_mgr.set("hypertable_created", datetime.utcnow().isoformat())
@@ -350,13 +376,14 @@ def _run_initial_setup(
             except Exception as e:
                 metadata_mgr.set("hypertable_error", str(e))
                 _LOGGER.warning(f"Could not create hypertable: {e}")
+                # Don't raise here - table creation succeeded, hypertable is optional
 
         return True
         
     except Exception as e:
         _LOGGER.error(f"Initial setup failed: {e}", exc_info=True)
         metadata_mgr.set("setup_error", str(e))
-        return False
+        raise  # Re-raise to trigger transaction rollback
 
 
 def _get_available_extensions(conn) -> set:
@@ -380,7 +407,7 @@ def _configure_timescaledb_policies(
     retention_days: Optional[int],
     metadata_mgr: 'MetadataManager'
 ):
-    """Configure TimescaleDB compression and retention policies."""
+    """Configure TimescaleDB compression and retention policies in separate transaction."""
     
     # Check if table is a hypertable
     try:
@@ -444,7 +471,7 @@ def _configure_timescaledb_policies(
 
 
 # =============================================================================
-# MIGRATIONS
+# MIGRATIONS (same as before, but with proper transaction handling)
 # =============================================================================
 
 @migration(1)

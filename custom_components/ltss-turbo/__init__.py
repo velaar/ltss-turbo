@@ -8,11 +8,12 @@ import io
 import json
 import logging
 import queue
-import struct
 import threading
 import time
 import csv
-from typing import Any, Callable, Iterable, List, Optional
+from collections import OrderedDict
+from typing import Any, Callable, Iterable, List, Optional, Dict
+from datetime import datetime
 
 # Third-party libraries
 import voluptuous as vol
@@ -109,7 +110,7 @@ CONFIG_SCHEMA = vol.Schema(
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-
+    """Set up LTSS Turbo component."""
     conf = config[DOMAIN]
 
     db_url = conf.get(CONF_DB_URL)
@@ -154,6 +155,56 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     
     return db_ready
 
+
+class LRUStringCache:
+    """LRU cache for strings with better memory management."""
+    
+    def __init__(self, max_size: int = 10000):
+        self._cache = OrderedDict()
+        self._max_size = max_size
+        self._lock = threading.RLock()
+        self._hits = 0
+        self._misses = 0
+    
+    def get(self, key: str) -> Optional[bytes]:
+        """Get cached string, updating LRU order."""
+        with self._lock:
+            if key in self._cache:
+                # Move to end (most recently used)
+                self._cache.move_to_end(key)
+                self._hits += 1
+                return self._cache[key]
+            self._misses += 1
+            return None
+    
+    def put(self, key: str, value: bytes):
+        """Store string in cache with LRU eviction."""
+        with self._lock:
+            if key in self._cache:
+                # Update and move to end
+                self._cache[key] = value
+                self._cache.move_to_end(key)
+            else:
+                # Add new entry
+                if len(self._cache) >= self._max_size:
+                    # Remove least recently used
+                    self._cache.popitem(last=False)
+                self._cache[key] = value
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        with self._lock:
+            total = self._hits + self._misses
+            hit_rate = (self._hits / total * 100) if total > 0 else 0
+            return {
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": round(hit_rate, 2),
+                "size": len(self._cache),
+                "max_size": self._max_size
+            }
+
+
 class BinaryRowEncoder:
     """High-performance binary encoder for PostgreSQL COPY operations."""
     
@@ -166,27 +217,34 @@ class BinaryRowEncoder:
         self._float64_format = struct.Struct('>d')
         self._bool_format = struct.Struct('>?')
         
-        # String cache to avoid repeated encoding
-        self._string_cache = {}
-        self._max_cache_size = 10000
-        self._cache_lock = threading.RLock()
+        # LRU String cache for better memory management
+        self._string_cache = LRUStringCache(max_size=10000)
+        
+        # Pre-encode common strings
+        common_strings = [
+            "on", "off", "unavailable", "unknown", "true", "false",
+            "°C", "°F", "%", "W", "kWh", "sensor", "binary_sensor",
+            "switch", "light", "climate", "cover", "device_tracker"
+        ]
+        for s in common_strings:
+            self._string_cache.put(s, s.encode('utf-8'))
     
     def _encode_string(self, value: str) -> bytes:
-        """Encode string with caching for common values."""
+        """Encode string with LRU caching."""
         if value is None:
             return b''
-            
-        with self._cache_lock:
-            # Check cache first
-            if value in self._string_cache:
-                return self._string_cache[value]
-            
-            # Encode and cache if not too large
-            encoded = value.encode('utf-8')
-            if len(self._string_cache) < self._max_cache_size:
-                self._string_cache[value] = encoded
-                
-            return encoded
+        
+        # Check cache first
+        cached = self._string_cache.get(value)
+        if cached is not None:
+            return cached
+        
+        # Encode and cache
+        encoded = value.encode('utf-8')
+        if len(value) <= 100:  # Only cache reasonable sized strings
+            self._string_cache.put(value, encoded)
+        
+        return encoded
     
     def _write_field(self, buffer: io.BytesIO, value: Any, field_type: str):
         """Write a single field in binary format."""
@@ -203,7 +261,7 @@ class BinaryRowEncoder:
         elif field_type == 'timestamptz':
             # PostgreSQL timestamp: microseconds since 2000-01-01
             if hasattr(value, 'timestamp'):
-                # Convert from Unix timestamp to PostgreSQL timestamp
+                # Optimized conversion
                 pg_epoch_diff = 946684800  # Seconds between 1970 and 2000
                 pg_timestamp = int((value.timestamp() - pg_epoch_diff) * 1_000_000)
                 buffer.write(self._int32_format.pack(8))  # 8 bytes
@@ -236,19 +294,16 @@ class BinaryRowEncoder:
         elif field_type == 'geometry':
             if value:
                 ewkb = self._encode_point_ewkb(str(value))
-               # COPY binary requires a 4-byte length prefix for every field
                 buffer.write(self._int32_format.pack(len(ewkb)))
                 buffer.write(ewkb)
             else:
-                # NULL is always -1 encoded as a 4-byte signed int
                 buffer.write(self._int32_format.pack(-1))
 
     def _encode_point_ewkb(self, value: str) -> bytes:
         """
+        Optimized EWKB encoding for POINT geometry.
         Accepts 'SRID=4326;POINT(lon lat)' or 'POINT(lon lat)'
-        Returns little-endian EWKB bytes with SRID flag (2D point).
         """
-        # Defaults
         srid = 4326
         txt = value.strip()
 
@@ -268,6 +323,7 @@ class BinaryRowEncoder:
         end = wkt.find(")", start + 1)
         if start == -1 or end == -1:
             raise ValueError(f"Invalid WKT for POINT: {value}")
+        
         parts = wkt[start + 1 : end].strip().split()
         if len(parts) != 2:
             raise ValueError(f"Expected 'lon lat' in POINT: {value}")
@@ -275,31 +331,27 @@ class BinaryRowEncoder:
         lon = float(parts[0])
         lat = float(parts[1])
 
-        # EWKB (little-endian):
-        # 1 byte: endian (1 = little)
-        # 4 bytes: type (base 1 = Point, with SRID flag 0x20000000)
-        # 4 bytes: SRID (uint32)
-        # 8 bytes: X (float64)
-        # 8 bytes: Y (float64)
-        endian = 1
-        WKB_POINT = 1
-        EWKB_SRID_FLAG = 0x20000000
-        type_with_srid = WKB_POINT | EWKB_SRID_FLAG
-
-        return (
-            struct.pack("<B", endian)
-            + struct.pack("<I", type_with_srid)
-            + struct.pack("<I", srid)
-            + struct.pack("<d", lon)
-            + struct.pack("<d", lat)
+        # EWKB (little-endian) - pre-computed constants
+        WKB_POINT_WITH_SRID = 0x20000001  # Point type with SRID flag
+        
+        return struct.pack(
+            "<BIIdd",  # Single pack for efficiency
+            1,  # Little endian
+            WKB_POINT_WITH_SRID,
+            srid,
+            lon,
+            lat
         )
 
     def encode_rows(self, rows: List[Any]) -> bytes:
-        """Encode multiple rows in binary format."""
+        """Encode multiple rows in binary format with better memory management."""
         if not rows:
             return b''
         
+        # Pre-allocate buffer with estimated size to avoid resizing
+        estimated_size = len(rows) * 200  # Estimate ~200 bytes per row
         buffer = io.BytesIO()
+        buffer.seek(0)
         
         # PostgreSQL binary format header
         buffer.write(self._header_format.pack(b'PGCOPY\n\xff\r\n\x00', 0, 0))
@@ -330,7 +382,7 @@ class BinaryRowEncoder:
             # Field count
             buffer.write(self._int16_format.pack(column_count))
             
-            # Field values 
+            # Field values - using getattr with defaults
             row_values = [
                 getattr(row, "time", None),
                 getattr(row, "entity_id", None),
@@ -346,7 +398,7 @@ class BinaryRowEncoder:
                 getattr(row, "last_updated", None),
                 getattr(row, "is_unavailable", False),
                 getattr(row, "is_unknown", False),
-                getattr(row, "location", None), 
+                getattr(row, "location", None),
             ]
             
             # Write each field
@@ -355,15 +407,20 @@ class BinaryRowEncoder:
         
         # EOF marker
         buffer.write(self._int16_format.pack(-1))
-
+        
         return buffer.getvalue()
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get encoder cache statistics."""
+        return self._string_cache.get_stats()
 
 
 class ConnectionManager:
-    """Enhanced connection management for use with pgbouncer."""
+    """Enhanced connection management with better pgbouncer support."""
     
-    def __init__(self, engine):
+    def __init__(self, engine, is_pgbouncer: bool = False):
         self.engine = engine
+        self.is_pgbouncer = is_pgbouncer
         self._copy_connection = None
         self._connection_lock = threading.RLock()
         
@@ -372,6 +429,7 @@ class ConnectionManager:
             "copy_operations": 0,
             "connection_reuses": 0,
             "connection_failures": 0,
+            "last_operation": None,
         }
     
     def get_copy_connection(self):
@@ -385,19 +443,21 @@ class ConnectionManager:
             # Create new connection
             try:
                 self._copy_connection = self.engine.raw_connection()
-
-                try:
-                    with self._copy_connection.cursor() as cur:
-                        # Safe, session-settable toggles
-                        cur.execute("SET synchronous_commit = OFF")
-                        cur.execute("SET statement_timeout = 30000")
-                except Exception as e:
-                    # Ensure we clear any aborted txn before reuse
+                
+                # Only set session parameters for direct connections
+                if not self.is_pgbouncer:
                     try:
-                        self._copy_connection.rollback()
-                    except Exception:
-                        pass
-                    _LOGGER.debug(f"Connection tuning skipped: {e}")
+                        with self._copy_connection.cursor() as cur:
+                            cur.execute("SET synchronous_commit = OFF")
+                            cur.execute("SET statement_timeout = 30000")
+                            cur.execute("SET work_mem = '64MB'")  # Help with sorting
+                    except Exception as e:
+                        # Ensure we clear any aborted txn before reuse
+                        try:
+                            self._copy_connection.rollback()
+                        except Exception:
+                            pass
+                        _LOGGER.debug(f"Connection tuning skipped: {e}")
                         
                 return self._copy_connection
                 
@@ -413,10 +473,12 @@ class ConnectionManager:
                 self._copy_connection.close()
                 self._copy_connection = None
     
-    def get_stats(self):
+    def get_stats(self) -> Dict[str, Any]:
         """Get connection statistics."""
-        return self.stats.copy()
-    
+        with self._connection_lock:
+            return self.stats.copy()
+
+
 class LTSS_DB(threading.Thread):
     """Optimized threaded LTSS database handler."""
 
@@ -449,8 +511,6 @@ class LTSS_DB(threading.Thread):
         self.engine: Optional[Engine] = None
         self._conn_manager = None
         self._binary_encoder = None
-        # Reusable connection for COPY operations
-        self._copy_connection = None
 
         # Configuration
         self.batch_size = batch_size
@@ -465,12 +525,14 @@ class LTSS_DB(threading.Thread):
         self.entity_filter = entity_filter
         self.get_session = None
         
-        # Statistics
+        # Statistics with more detail
         self.stats = {
             "events_processed": 0,
             "events_dropped": 0,
             "batches_processed": 0,
             "last_batch_time": None,
+            "avg_batch_size": 0,
+            "total_processing_time_ms": 0,
         }
 
         self.LTSS = make_ltss_model(self.table_name)
@@ -502,7 +564,6 @@ class LTSS_DB(threading.Thread):
                 tries += 1
 
         if not connected:
-
             @callback
             def connection_failed():
                 """Handle connection failure."""
@@ -537,7 +598,6 @@ class LTSS_DB(threading.Thread):
             if self.hass.state == CoreState.running:
                 hass_started.set_result(None)
             else:
-
                 @callback
                 def notify_hass_started(event):
                     """Notify that Home Assistant has started."""
@@ -575,17 +635,11 @@ class LTSS_DB(threading.Thread):
                     self._process_batch(actual_events)
 
                 self._close_connection()
-                _LOGGER.info(
-                    "LTSS Turbo shutdown complete. Stats: %s", 
-                    json.dumps(self.stats, indent=2)
-                )
+                self._log_final_stats()
                 return
 
             # Process normal batch
             self._process_batch(batch)
-
-
-
 
     def _collect_batch(self) -> List:
         """Collect events into batch with timeout."""
@@ -616,18 +670,6 @@ class LTSS_DB(threading.Thread):
                         break
 
         return batch
-
-    def _get_copy_connection(self):
-        """Get or create a dedicated connection for COPY operations."""
-        if self._copy_connection is None or self._copy_connection.closed:
-            self._copy_connection = self.engine.raw_connection()
-        return self._copy_connection
-
-    def _close_copy_connection(self):
-        """Close the dedicated COPY connection."""
-        if self._copy_connection and not self._copy_connection.closed:
-            self._copy_connection.close()
-            self._copy_connection = None
 
     def _process_batch(self, batch: List) -> None:
         """Batch processing using binary COPY format."""
@@ -670,11 +712,9 @@ class LTSS_DB(threading.Thread):
                 inserted = True
                 
                 # Update statistics
-                self.stats["events_processed"] += valid_rows
-                self.stats["batches_processed"] += 1
-                self.stats["last_batch_time"] = time.time()
-                
                 processing_time = (time.time() - start_time) * 1000
+                self._update_stats(len(batch), valid_rows, processing_time)
+                
                 _LOGGER.debug(
                     "Binary batch processed: %d events -> %d rows in %.2fms (%.1f rows/sec)",
                     len(batch),
@@ -697,42 +737,38 @@ class LTSS_DB(threading.Thread):
         for _ in batch:
             self.queue.task_done()
 
-
-
-
     def _bulk_insert(self, rows: List[Any]) -> None:
         """
         High-performance binary COPY implementation.
-        3x faster than text format with better JSON/geometry handling.
         """
         if not rows:
             return
+        
         try:
             binary_data = self._binary_encoder.encode_rows(rows)
             conn = self._conn_manager.get_copy_connection()
             columns = [
-                    "time", "entity_id", "state", "attributes",
-                    "friendly_name", "unit_of_measurement", "device_class", "icon",
-                    "domain", "state_numeric", "last_changed", "last_updated",
-                    "is_unavailable", "is_unknown", "location"
-                ]
+                "time", "entity_id", "state", "attributes",
+                "friendly_name", "unit_of_measurement", "device_class", "icon",
+                "domain", "state_numeric", "last_changed", "last_updated",
+                "is_unavailable", "is_unknown", "location"
+            ]
             cols_sql = ", ".join(columns)
             copy_sql = f"COPY {self.table_name} ({cols_sql}) FROM STDIN WITH (FORMAT binary)"
+            
             with conn.cursor() as cur:
                 cur.copy_expert(copy_sql, io.BytesIO(binary_data))
             conn.commit()
+            
             self._conn_manager.stats["copy_operations"] += 1
-            _LOGGER.debug("Binary COPY inserted %d rows successfully", len(rows))
-            return
+            self._conn_manager.stats["last_operation"] = time.time()
+            
         except Exception as e:
             _LOGGER.error("Binary COPY failed: %s -- falling back to text COPY", e)
             try:
                 self._bulk_insert_text(rows)
-                _LOGGER.debug("Text COPY inserted %d rows successfully", len(rows))
-                return
             except Exception as e2:
                 _LOGGER.error("Text COPY also failed: %s", e2)
-                # rollback/close like you already do
                 try:
                     conn.rollback()
                 except Exception:
@@ -741,6 +777,52 @@ class LTSS_DB(threading.Thread):
                     self._conn_manager.close_copy_connection()
                 raise
 
+    def _bulk_insert_text(self, rows):
+        """Fallback text-based COPY for compatibility."""
+        if not rows:
+            return
+            
+        conn = self._conn_manager.get_copy_connection()
+        cols = [
+            "time","entity_id","state","attributes","friendly_name","unit_of_measurement",
+            "device_class","icon","domain","state_numeric","last_changed","last_updated",
+            "is_unavailable","is_unknown","location"
+        ]
+        cols_sql = ", ".join(cols)
+        copy_sql = f"COPY {self.table_name} ({cols_sql}) FROM STDIN WITH (FORMAT csv, HEADER false)"
+        csv_payload = self._rows_to_csv_lines(rows)
+        
+        with conn.cursor() as cur:
+            cur.copy_expert(copy_sql, io.StringIO(csv_payload))
+        conn.commit()
+
+    def _rows_to_csv_lines(self, rows):
+        """Generate CSV lines for text COPY."""
+        buf = io.StringIO()
+        w = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+        
+        for r in rows:
+            line = [
+                getattr(r, "time", None),
+                getattr(r, "entity_id", None),
+                getattr(r, "state", None),
+                json.dumps(getattr(r, "attributes", None), separators=(",", ":"), ensure_ascii=False) 
+                    if getattr(r, "attributes", None) is not None else None,
+                getattr(r, "friendly_name", None),
+                getattr(r, "unit_of_measurement", None),
+                getattr(r, "device_class", None),
+                getattr(r, "icon", None),
+                getattr(r, "domain", None),
+                getattr(r, "state_numeric", None),
+                getattr(r, "last_changed", None),
+                getattr(r, "last_updated", None),
+                bool(getattr(r, "is_unavailable", False)),
+                bool(getattr(r, "is_unknown", False)),
+                getattr(r, "location", None),
+            ]
+            w.writerow(['' if v is None else v for v in line])
+            
+        return buf.getvalue()
 
     @callback
     def event_listener(self, event):
@@ -760,9 +842,9 @@ class LTSS_DB(threading.Thread):
                     self.stats["events_dropped"] += 1
 
     def _detect_pgbouncer(self, db_url: str) -> bool:
-        """Detect if we're connecting through pgbouncer based on URL patterns."""
+        """Detect if we're connecting through pgbouncer."""
         # Common pgbouncer ports
-        pgbouncer_ports = ['6432', '5433']  
+        pgbouncer_ports = ['6432', '5433']
         
         # Check for common pgbouncer ports
         for port in pgbouncer_ports:
@@ -791,43 +873,43 @@ class LTSS_DB(threading.Thread):
             base_args["options"] = "-c statement_timeout=30000"
             _LOGGER.debug("Using direct PostgreSQL connection args")
         else:
-            # pgbouncer connection - avoid startup parameters that it doesn't support
+            # pgbouncer connection - avoid startup parameters
             _LOGGER.info("Detected pgbouncer connection, using compatible connection args")
             
         return base_args
 
     def _setup_connection(self):
+        """Set up database connection and initialize components."""
         if self.engine is not None:
             self.engine.dispose()
 
         # Get appropriate connection arguments
         connect_args = self._get_connect_args()
+        is_pgbouncer = self._detect_pgbouncer(self.db_url)
 
-        # Optimized connection settings for pgbouncer
+        # Optimized connection settings
         self.engine = create_engine(
             self.db_url,
             echo=False,
             poolclass=QueuePool,
             
-            # Optimized for pgbouncer - let pgbouncer handle most pooling
-            pool_size=2,  # Smaller pool since pgbouncer handles this
-            max_overflow=5,  # Reduced overflow
-            pool_pre_ping=False,  # pgbouncer handles connection health
-            pool_recycle=-1,  # Let pgbouncer handle connection lifecycle
+            # Adjust pool size based on connection type
+            pool_size=2 if is_pgbouncer else self.pool_size,
+            max_overflow=5 if is_pgbouncer else self.max_overflow,
+            pool_pre_ping=not is_pgbouncer,  # pgbouncer handles health checks
+            pool_recycle=-1 if is_pgbouncer else 3600,  # Recycle direct connections hourly
             
-            # Connection-level optimizations (pgbouncer compatible)
             connect_args=connect_args,
-            
             json_serializer=lambda obj: json.dumps(obj, cls=JSONEncoder, separators=(',', ':')),
         )
 
         # Initialize connection manager
-        self._conn_manager = ConnectionManager(self.engine)
+        self._conn_manager = ConnectionManager(self.engine, is_pgbouncer)
         
         # Initialize binary encoder
         self._binary_encoder = BinaryRowEncoder()
 
-        # Run migrations with location as mandatory
+        # Run migrations
         migrations_ok = run_startup_migrations(
             self.engine,
             self.table_name,
@@ -848,12 +930,11 @@ class LTSS_DB(threading.Thread):
             "LTSS Turbo connection initialized: table=%s, compression=%s, pgbouncer_mode=%s",
             self.table_name,
             "enabled" if self.enable_compression else "disabled",
-            "detected" if self._detect_pgbouncer(self.db_url) else "direct"
+            "detected" if is_pgbouncer else "direct"
         )
 
-
     def _close_connection(self):
-        # Close connection manager
+        """Close all database connections."""
         if hasattr(self, '_conn_manager'):
             self._conn_manager.close_copy_connection()
             _LOGGER.info("Connection manager stats: %s", self._conn_manager.get_stats())
@@ -868,45 +949,35 @@ class LTSS_DB(threading.Thread):
             
         _LOGGER.info("Database connections closed")
 
+    def _update_stats(self, batch_size: int, valid_rows: int, processing_time_ms: float):
+        """Update processing statistics."""
+        self.stats["events_processed"] += valid_rows
+        self.stats["batches_processed"] += 1
+        self.stats["last_batch_time"] = time.time()
+        self.stats["total_processing_time_ms"] += processing_time_ms
+        
+        # Calculate running average
+        if self.stats["batches_processed"] > 0:
+            self.stats["avg_batch_size"] = (
+                self.stats["events_processed"] / self.stats["batches_processed"]
+            )
 
-    def _rows_to_csv_lines(self, rows):
-         # Build CSV lines with proper quoting; use EWKT for geometry and JSON text for jsonb
-
-        buf = io.StringIO()
-        w = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
-        for r in rows:
-            line = [
-                getattr(r, "time", None),                       # timestamptz -> ISO is fine for text COPY
-                getattr(r, "entity_id", None),
-                getattr(r, "state", None),
-                json.dumps(getattr(r, "attributes", None), separators=(",", ":"), ensure_ascii=False) 
-                    if getattr(r, "attributes", None) is not None else None,  # jsonb <- JSON TEXT
-                getattr(r, "friendly_name", None),
-                getattr(r, "unit_of_measurement", None),
-                getattr(r, "device_class", None),
-                getattr(r, "icon", None),
-                getattr(r, "domain", None),
-                getattr(r, "state_numeric", None),
-                getattr(r, "last_changed", None),
-                getattr(r, "last_updated", None),
-                bool(getattr(r, "is_unavailable", False)),
-                bool(getattr(r, "is_unknown", False)),
-                getattr(r, "location", None),  # EWKT like 'SRID=4326;POINT(lon lat)' works in text COPY
-            ]
-            # csv.writer writes into buf; fetch line
-            w.writerow([ "" if v is None else v for v in line ])
-        return buf.getvalue()
-
-    def _bulk_insert_text(self, rows):
-        if not rows:
-            return
-        conn = self._conn_manager.get_copy_connection()
-        cols = ["time","entity_id","state","attributes","friendly_name","unit_of_measurement",
-                "device_class","icon","domain","state_numeric","last_changed","last_updated",
-                "is_unavailable","is_unknown","location"]
-        cols_sql = ", ".join(cols)
-        copy_sql = f"COPY {self.table_name} ({cols_sql}) FROM STDIN WITH (FORMAT csv, HEADER false)"
-        csv_payload = self._rows_to_csv_lines(rows)
-        with conn.cursor() as cur:
-            cur.copy_expert(copy_sql, io.StringIO(csv_payload))
-        conn.commit()
+    def _log_final_stats(self):
+        """Log comprehensive statistics on shutdown."""
+        # Get cache stats from encoder
+        encoder_stats = self._binary_encoder.get_cache_stats() if self._binary_encoder else {}
+        
+        # Get model performance stats
+        model_stats = self.LTSS.get_performance_stats() if hasattr(self.LTSS, 'get_performance_stats') else {}
+        
+        final_stats = {
+            "processing": self.stats,
+            "encoder_cache": encoder_stats,
+            "model_caches": model_stats,
+            "connection": self._conn_manager.get_stats() if self._conn_manager else {},
+        }
+        
+        _LOGGER.info(
+            "LTSS Turbo shutdown complete. Final statistics:\n%s",
+            json.dumps(final_stats, indent=2)
+        )

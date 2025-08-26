@@ -1,0 +1,177 @@
+# requirements-test.txt
+# Testing dependencies for LTSS Turbo
+# Keep minimal to stay within free tier limits
+
+# Core testing
+pytest==7.4.3
+pytest-cov==4.1.0
+pytest-asyncio==0.21.1
+pytest-timeout==2.2.0
+
+# Mocking
+pytest-mock==3.12.0
+
+# Code quality (optional, for local development)
+black==23.12.0
+isort==5.13.2
+flake8==6.1.0
+pylint==3.0.3
+mypy==1.7.1
+
+# Security scanning (optional)
+safety==3.0.1
+bandit==1.7.5
+
+# Core dependencies needed for testing
+sqlalchemy>=2.0.20,<3.0
+psycopg2-binary>=2.9.7,<3.0
+geoalchemy2>=0.14.0,<1.0
+voluptuous>=0.13.1
+
+---
+
+# .pre-commit-config.yaml
+# Pre-commit hooks for code quality
+# Install: pip install pre-commit
+# Setup: pre-commit install
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/psf/black
+    rev: 23.12.0
+    hooks:
+      - id: black
+        language_version: python3.11
+        args: ['--line-length=120']
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ['--profile', 'black', '--line-length=120']
+
+  - repo: https://github.com/pycqa/flake8
+    rev: 6.1.0
+    hooks:
+      - id: flake8
+        args: ['--max-line-length=120', '--extend-ignore=E203,W503']
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.7.1
+    hooks:
+      - id: mypy
+        additional_dependencies: [types-all]
+        args: ['--ignore-missing-imports']
+
+---
+
+# pytest.ini
+# PyTest configuration
+
+[tool:pytest]
+minversion = 7.0
+testpaths = tests
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+addopts = 
+    -ra
+    --strict-markers
+    --cov=custom_components/ltss_turbo
+    --cov-branch
+    --cov-report=term-missing:skip-covered
+    --cov-report=html
+    --cov-report=xml
+    --cov-fail-under=70
+    -p no:warnings
+markers =
+    unit: Unit tests (fast)
+    integration: Integration tests (require database)
+    slow: Slow tests
+    asyncio: Async tests
+asyncio_mode = auto
+timeout = 30
+log_cli = true
+log_cli_level = INFO
+
+---
+
+# .coveragerc
+# Coverage.py configuration
+
+[run]
+source = custom_components/ltss_turbo
+omit = 
+    */tests/*
+    */test_*.py
+    */__pycache__/*
+    */site-packages/*
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise AssertionError
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+    @abstract
+    @abstractmethod
+precision = 2
+show_missing = True
+skip_covered = False
+
+[html]
+directory = htmlcov
+
+[xml]
+output = coverage.xml
+
+---
+
+# tox.ini
+# Tox configuration for testing multiple Python versions
+# Optional - only if you want comprehensive local testing
+
+[tox]
+envlist = py{39,310,311,312}, lint, security
+skipsdist = True
+
+[testenv]
+deps = -rrequirements-test.txt
+commands = pytest {posargs}
+setenv =
+    DATABASE_URL = postgresql://test:test@localhost:5432/test
+
+[testenv:lint]
+deps = 
+    black
+    isort
+    flake8
+    pylint
+    mypy
+commands =
+    black --check custom_components/ltss_turbo tests/
+    isort --check-only custom_components/ltss_turbo tests/
+    flake8 custom_components/ltss_turbo tests/
+    pylint custom_components/ltss_turbo
+    mypy custom_components/ltss_turbo
+
+[testenv:security]
+deps =
+    safety
+    bandit
+commands =
+    safety check
+    bandit -r custom_components/ltss_turbo

@@ -1,28 +1,87 @@
-"""Optimized models.py with high-performance state parsing and optional location support."""
+"""Optimized models.py with LRU cache and enhanced memory management."""
 
 import re
 import json
 from datetime import datetime
 import logging
-from typing import Optional, Dict, Any, Set
+from typing import Optional, Dict, Any, Set, Tuple
 from functools import lru_cache
 import threading
+from collections import OrderedDict
 
 from sqlalchemy import Column, DateTime, String, Float, Boolean
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base, mapped_column, Mapped
 from geoalchemy2 import Geometry
 
-
 _LOGGER = logging.getLogger(__name__)
 
 Base = declarative_base()
 
+
+class LRUCache:
+    """Thread-safe LRU cache implementation."""
+    
+    def __init__(self, max_size: int = 10000):
+        self._cache = OrderedDict()
+        self._max_size = max_size
+        self._lock = threading.RLock()
+        self._hits = 0
+        self._misses = 0
+    
+    def get(self, key: Any) -> Any:
+        """Get value from cache, updating LRU order."""
+        with self._lock:
+            if key in self._cache:
+                # Move to end (most recently used)
+                self._cache.move_to_end(key)
+                self._hits += 1
+                return self._cache[key]
+            self._misses += 1
+            return None
+    
+    def put(self, key: Any, value: Any):
+        """Store value in cache with LRU eviction."""
+        with self._lock:
+            if key in self._cache:
+                # Update and move to end
+                self._cache[key] = value
+                self._cache.move_to_end(key)
+            else:
+                # Add new entry
+                if len(self._cache) >= self._max_size:
+                    # Remove least recently used (10% to avoid frequent evictions)
+                    evict_count = max(1, self._max_size // 10)
+                    for _ in range(evict_count):
+                        self._cache.popitem(last=False)
+                self._cache[key] = value
+    
+    def clear(self):
+        """Clear the cache."""
+        with self._lock:
+            self._cache.clear()
+            self._hits = 0
+            self._misses = 0
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        with self._lock:
+            total = self._hits + self._misses
+            hit_rate = (self._hits / total * 100) if total > 0 else 0
+            return {
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": round(hit_rate, 2),
+                "size": len(self._cache),
+                "max_size": self._max_size
+            }
+
+
 class OptimizedStateParser:
-    """High-performance state parser with comprehensive caching."""
+    """High-performance state parser with LRU caching."""
     
     def __init__(self):
-        # Pre-compiled regex patterns (compiled once, reused millions of times)
+        # Pre-compiled regex patterns
         self.NUMERIC_PATTERN = re.compile(r'^-?\d+(?:\.\d+)?$')
         self.TIMESTAMP_ISO_PATTERN = re.compile(r'^\d{4}-\d{2}-\d{2}')
         self.TIMESTAMP_UNIX_SEC_PATTERN = re.compile(r'^\d{10}$')
@@ -38,6 +97,8 @@ class OptimizedStateParser:
             "home": 1.0, "away": 0.0, "not_home": 0.0, "active": 1.0, "inactive": 0.0,
             "armed": 1.0, "disarmed": 0.0, "present": 1.0, "absent": 0.0,
             "detected": 1.0, "clear": 0.0, "occupied": 1.0, "unoccupied": 0.0,
+            "above": 1.0, "below": 0.0, "triggered": 1.0, "untriggered": 0.0,
+            "enabled": 1.0, "disabled": 0.0, "running": 1.0, "stopped": 0.0,
         }
         
         self.CLIMATE_STATES = {
@@ -47,162 +108,177 @@ class OptimizedStateParser:
         
         self.LEVEL_STATES = {
             "low": 0.0, "medium": 1.0, "high": 2.0, "very_high": 3.0,
-            "min": 0.0, "mid": 1.0, "max": 2.0,
+            "min": 0.0, "mid": 1.0, "max": 2.0, "auto": -1.0,
+            "quiet": 0.0, "normal": 1.0, "boost": 2.0,
         }
         
         self.SPECIAL_STATES = {
             "unavailable": -1.0, "unknown": -2.0, "none": -3.0,
-            "error": -4.0, "fault": -5.0,
+            "error": -4.0, "fault": -5.0, "problem": -6.0,
         }
         
-        # Thread-safe parsing cache for expensive operations
-        self._parse_cache = {}
-        self._cache_lock = threading.RLock()
-        self._max_cache_size = 10000
-        self._cache_hits = 0
-        self._cache_misses = 0
+        # Combine all static mappings for O(1) lookup
+        self.ALL_STATIC_STATES = {
+            **self.BINARY_STATES,
+            **self.CLIMATE_STATES,
+            **self.LEVEL_STATES,
+            **self.SPECIAL_STATES,
+        }
+        
+        # LRU cache for expensive parsing operations
+        self._parse_cache = LRUCache(max_size=10000)
         
         # Domain sets for fast membership testing
-        self.BINARY_DOMAINS = {
+        self.BINARY_DOMAINS = frozenset([
             "binary_sensor", "switch", "input_boolean", "light", 
-            "fan", "cover", "lock", "person", "device_tracker"
-        }
+            "fan", "cover", "lock", "person", "device_tracker", "group"
+        ])
+        
+        self.NUMERIC_DOMAINS = frozenset([
+            "sensor", "number", "input_number", "counter"
+        ])
         
         # Pre-compiled translation table for cleaning
         self.CONTROL_CHARS = str.maketrans({
             '\x00': '\ufffd', '\u00A0': ' ', '\u200B': '',
             '\t': ' ', '\n': ' ', '\r': ' ',
         })
+        
+        # Cache for domain extraction
+        self._domain_cache = {}
+        self._domain_cache_lock = threading.RLock()
     
-    @lru_cache(maxsize=5000)
-    def _get_domain(self, entity_id: str) -> str:
+    def get_domain(self, entity_id: str) -> str:
         """Extract domain from entity_id with caching."""
-        return entity_id.split(".", 1)[0] if "." in entity_id else "unknown"
+        with self._domain_cache_lock:
+            if entity_id in self._domain_cache:
+                return self._domain_cache[entity_id]
+            
+            domain = entity_id.split(".", 1)[0] if "." in entity_id else "unknown"
+            
+            # Cache if not too large
+            if len(self._domain_cache) < 5000:
+                self._domain_cache[entity_id] = domain
+            
+            return domain
     
-    def parse_numeric_state(self, raw_state: str, device_class: Optional[str], 
-                           domain: Optional[str], entity_id: str, 
-                           options: Optional[list] = None) -> Optional[float]:
+    def parse_numeric_state(
+        self, 
+        raw_state: str, 
+        device_class: Optional[str], 
+        domain: Optional[str], 
+        entity_id: str, 
+        options: Optional[list] = None
+    ) -> Optional[float]:
         """
-        Ultra-optimized numeric state parsing with multi-level caching.
+        Ultra-optimized numeric state parsing with LRU caching.
         
         Performance improvements:
-        - Cache results for expensive parsing operations
-        - Early returns for most common cases (70% of states are numeric)
-        - Minimize string operations and regex usage
-        - Use set membership instead of dict lookups where faster
+        - LRU cache for expensive operations
+        - Early returns for common cases
+        - Combined static state lookup
+        - Minimized string operations
         """
         if not raw_state or not isinstance(raw_state, str):
             return None
         
-        # Create cache key for complex parsing operations
-        cache_key = None
-        needs_caching = (
-            device_class == "timestamp" or 
-            options or 
-            "%" in raw_state or
-            len(raw_state) > 20  # Cache longer strings
+        # Fast path 1: Check static mappings first (O(1) lookup)
+        state_lower = raw_state.strip().lower()
+        if state_lower in self.ALL_STATIC_STATES:
+            return self.ALL_STATIC_STATES[state_lower]
+        
+        # Fast path 2: Direct numeric conversion (most common case ~60%)
+        # Optimized check - single pass character validation
+        clean_state = raw_state.strip()
+        if clean_state:
+            # Quick numeric check
+            is_numeric = True
+            decimal_count = 0
+            minus_count = 0
+            
+            for i, char in enumerate(clean_state):
+                if char == '.':
+                    decimal_count += 1
+                    if decimal_count > 1:
+                        is_numeric = False
+                        break
+                elif char == '-':
+                    minus_count += 1
+                    if minus_count > 1 or i > 0:
+                        is_numeric = False
+                        break
+                elif not char.isdigit():
+                    is_numeric = False
+                    break
+            
+            if is_numeric:
+                try:
+                    return float(clean_state)
+                except (ValueError, TypeError):
+                    pass
+        
+        # Check cache for expensive operations
+        cache_key = (raw_state, device_class, domain, bool(options))
+        cached_result = self._parse_cache.get(cache_key)
+        if cached_result is not None:
+            return cached_result if cached_result != "NULL" else None
+        
+        # Complex parsing (expensive operations)
+        result = self._parse_complex_state(
+            raw_state, device_class, domain, entity_id, options, state_lower
         )
         
-        if needs_caching:
-            cache_key = (raw_state, device_class, domain, bool(options))
-            with self._cache_lock:
-                if cache_key in self._parse_cache:
-                    self._cache_hits += 1
-                    return self._parse_cache[cache_key]
-                self._cache_misses += 1
+        # Cache the result (use "NULL" marker for None to differentiate from cache miss)
+        self._parse_cache.put(cache_key, result if result is not None else "NULL")
         
-        # Fast path 1: Direct numeric conversion (handles ~70% of cases)
-        # Optimized check - avoid multiple replace calls
-        if raw_state.replace('.', '', 1).replace('-', '', 1).isdigit():
-            try:
-                result = float(raw_state)
-                if needs_caching:
-                    self._cache_result(cache_key, result)
-                return result
-            except (ValueError, TypeError):
-                pass
-        
-        # Fast path 2: Pre-normalized state for common comparisons
-        state_lower = raw_state.strip().lower()
-        
-        # Special states (second most common ~15% of cases)
-        if state_lower in self.SPECIAL_STATES:
-            result = self.SPECIAL_STATES[state_lower]
-            if needs_caching:
-                self._cache_result(cache_key, result)
-            return result
-        
-        # Fast path 3: Pure numeric pattern matching
-        if self.NUMERIC_PATTERN.match(raw_state.strip()):
-            try:
-                result = float(raw_state)
-                if needs_caching:
-                    self._cache_result(cache_key, result)
-                return result
-            except (ValueError, TypeError):
-                pass
-        
-        # Complex parsing (expensive operations - always cache results)
+        return result
+    
+    def _parse_complex_state(
+        self,
+        raw_state: str,
+        device_class: Optional[str],
+        domain: Optional[str],
+        entity_id: str,
+        options: Optional[list],
+        state_lower: str
+    ) -> Optional[float]:
+        """Handle complex state parsing that requires regex or special logic."""
         
         # Timestamp handling
         if device_class == "timestamp":
-            result = self._parse_timestamp(raw_state)
-            self._cache_result(cache_key, result)
-            return result
-        
-        # Domain-specific optimizations
-        if domain == "climate" and state_lower in self.CLIMATE_STATES:
-            result = self.CLIMATE_STATES[state_lower]
-            if needs_caching:
-                self._cache_result(cache_key, result)
-            return result
-        
-        if domain in self.BINARY_DOMAINS and state_lower in self.BINARY_STATES:
-            result = self.BINARY_STATES[state_lower]
-            if needs_caching:
-                self._cache_result(cache_key, result)
-            return result
-        
-        if state_lower in self.LEVEL_STATES:
-            result = self.LEVEL_STATES[state_lower]
-            if needs_caching:
-                self._cache_result(cache_key, result)
-            return result
+            return self._parse_timestamp(raw_state)
         
         # Categorical options (input_select, etc.)
         if options and isinstance(options, list):
             try:
-                result = float(options.index(raw_state))
-                self._cache_result(cache_key, result)
-                return result
+                return float(options.index(raw_state))
             except (ValueError, TypeError):
                 pass
         
-        # Percentage handling (regex is expensive, always cache)
+        # Percentage handling
         if "%" in raw_state:
             match = self.PERCENTAGE_PATTERN.search(raw_state)
             if match:
                 try:
-                    result = float(match.group(1))
-                    self._cache_result(cache_key, result)
-                    return result
+                    return float(match.group(1))
                 except (ValueError, TypeError):
                     pass
+        
+        # Try pure numeric pattern
+        if self.NUMERIC_PATTERN.match(raw_state.strip()):
+            try:
+                return float(raw_state)
+            except (ValueError, TypeError):
+                pass
         
         # Last resort: extract any numeric value from string
         match = self.NUMERIC_EXTRACT_PATTERN.search(raw_state)
         if match:
             try:
-                result = float(match.group(0))
-                if needs_caching:
-                    self._cache_result(cache_key, result)
-                return result
+                return float(match.group(0))
             except (ValueError, TypeError):
                 pass
         
-        # Cache miss - store None to avoid re-parsing
-        if needs_caching:
-            self._cache_result(cache_key, None)
         return None
     
     def _parse_timestamp(self, raw_state: str) -> Optional[float]:
@@ -223,41 +299,22 @@ class OptimizedStateParser:
             pass
         return None
     
-    def _cache_result(self, cache_key, result):
-        """Cache parsing result with size limit and LRU eviction."""
-        if cache_key is None:
-            return
-            
-        with self._cache_lock:
-            # Simple FIFO cache eviction when full
-            if len(self._parse_cache) >= self._max_cache_size:
-                # Remove oldest 20% of entries
-                keys_to_remove = list(self._parse_cache.keys())[:self._max_cache_size // 5]
-                for key in keys_to_remove:
-                    del self._parse_cache[key]
-            
-            self._parse_cache[cache_key] = result
-    
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache performance statistics."""
-        with self._cache_lock:
-            total_requests = self._cache_hits + self._cache_misses
-            hit_rate = (self._cache_hits / total_requests * 100) if total_requests > 0 else 0
-            
-            return {
-                "cache_hits": self._cache_hits,
-                "cache_misses": self._cache_misses,
-                "hit_rate_percent": round(hit_rate, 2),
-                "cache_size": len(self._parse_cache),
-                "max_cache_size": self._max_cache_size
-            }
+        return self._parse_cache.get_stats()
+    
+    def clear_cache(self):
+        """Clear all caches."""
+        self._parse_cache.clear()
+        with self._domain_cache_lock:
+            self._domain_cache.clear()
 
 
 class StringInternPool:
-    """String interning pool for common values to reduce memory usage."""
+    """Optimized string interning pool with LRU eviction."""
     
     def __init__(self, max_size=5000):
-        self._pool = {}
+        self._pool = OrderedDict()
         self._max_size = max_size
         self._lock = threading.RLock()
         self._hits = 0
@@ -268,29 +325,40 @@ class StringInternPool:
             "on", "off", "unavailable", "unknown", "°C", "°F", "%", 
             "lux", "W", "kWh", "V", "A", "temperature", "humidity",
             "motion", "door", "window", "light", "switch", "sensor",
-            "binary_sensor", "device_tracker", "climate", "cover"
+            "binary_sensor", "device_tracker", "climate", "cover",
+            "true", "false", "open", "closed", "home", "away",
+            "locked", "unlocked", "triggered", "clear", "detected",
         ]
         for value in common_values:
             self._pool[value] = value
     
     def intern(self, string_val: Optional[str]) -> Optional[str]:
-        """Intern string if beneficial for memory usage."""
-        if not string_val or len(string_val) > 100:  # Don't intern very long strings
+        """Intern string with LRU eviction."""
+        if not string_val:
+            return string_val
+            
+        # Don't intern very long strings or URLs
+        if len(string_val) > 100 or '://' in string_val:
             return string_val
             
         with self._lock:
             if string_val in self._pool:
+                # Move to end (most recently used)
+                self._pool.move_to_end(string_val)
                 self._hits += 1
                 return self._pool[string_val]
             
             self._misses += 1
             
-            # Only intern if we have space and string is worth interning
-            if len(self._pool) < self._max_size and len(string_val) > 2:
-                self._pool[string_val] = string_val
-                return string_val
+            # Add to pool with LRU eviction
+            if len(self._pool) >= self._max_size:
+                # Remove least recently used (10% for efficiency)
+                evict_count = max(1, self._max_size // 10)
+                for _ in range(evict_count):
+                    self._pool.popitem(last=False)
             
-        return string_val
+            self._pool[string_val] = string_val
+            return string_val
     
     def get_stats(self) -> Dict[str, Any]:
         """Get string interning statistics."""
@@ -301,20 +369,31 @@ class StringInternPool:
             return {
                 "hits": self._hits,
                 "misses": self._misses,
-                "hit_rate_percent": round(hit_rate, 2),
+                "hit_rate": round(hit_rate, 2),
                 "pool_size": len(self._pool),
                 "max_pool_size": self._max_size
             }
+    
+    def clear(self):
+        """Clear the intern pool."""
+        with self._lock:
+            # Keep common values
+            common = ["on", "off", "unavailable", "unknown", "true", "false"]
+            temp = {k: v for k, v in self._pool.items() if k in common}
+            self._pool.clear()
+            self._pool.update(temp)
+            self._hits = 0
+            self._misses = 0
 
 
 def make_ltss_model(table_name: str = "ltss_turbo"):
-    """Create optimized LTSS model with optional location support."""
+    """Create optimized LTSS model with enhanced performance features."""
     
     # Remove stale table from metadata
     if table_name in Base.metadata.tables:
         Base.metadata.remove(Base.metadata.tables[table_name])
     
-    # Create shared instances for performance
+    # Create shared instances for performance (singleton pattern)
     state_parser = OptimizedStateParser()
     string_pool = StringInternPool()
     
@@ -348,19 +427,20 @@ def make_ltss_model(table_name: str = "ltss_turbo"):
         is_unavailable = Column(Boolean, default=False, nullable=False)
         is_unknown = Column(Boolean, default=False, nullable=False)
         
+        # Optional location column (PostGIS)
         location = Column(Geometry("POINT", srid=4326), nullable=True)
         
         @classmethod
         def from_event(cls, event) -> Optional['LTSS']:
             """
-            Highly optimized event-to-record conversion with optional location support.
+            Highly optimized event-to-record conversion.
             
             Key optimizations:
             - Single-pass attribute processing
-            - String interning for common values  
+            - String interning with LRU
             - Cached domain extraction
-            - Optimized state parsing with caching
-            - Location processing (when available)
+            - LRU cached state parsing
+            - Efficient location processing
             """
             try:
                 # Fast field extraction
@@ -370,22 +450,25 @@ def make_ltss_model(table_name: str = "ltss_turbo"):
                 if not entity_id or not state:
                     return None
                 
-                # Cached domain extraction
-                domain = state_parser._get_domain(entity_id)
+                # Get domain with caching
+                domain = state_parser.get_domain(entity_id)
                 
-                # State processing with optimizations
+                # State processing
                 state_str = state.state
                 is_unavailable = state_str == "unavailable"
                 is_unknown = state_str == "unknown"
                 
-                # Clean state string using pre-compiled translation table
-                clean_state = state_str.translate(state_parser.CONTROL_CHARS) if state_str else None
+                # Clean state string (only if needed)
+                if state_str and any(ord(c) < 32 for c in state_str):
+                    clean_state = state_str.translate(state_parser.CONTROL_CHARS)
+                else:
+                    clean_state = state_str
                 
-                # Single-pass attribute processing
+                # Single-pass attribute processing with early extraction
                 attrs = state.attributes
                 attrs_dict = {}
                 
-                # Extracted metadata
+                # Pre-initialize to avoid repeated checks
                 friendly_name = None
                 unit_of_measurement = None
                 device_class = None
@@ -395,24 +478,26 @@ def make_ltss_model(table_name: str = "ltss_turbo"):
                 options = None
                 
                 if attrs:
+                    # Process attributes in priority order
                     for key, value in attrs.items():
                         if key == "friendly_name":
-                            friendly_name = string_pool.intern(str(value)) if value else None
+                            friendly_name = string_pool.intern(str(value)[:255]) if value else None
                         elif key == "unit_of_measurement":
-                            unit_of_measurement = string_pool.intern(str(value)) if value else None
+                            unit_of_measurement = string_pool.intern(str(value)[:50]) if value else None
                         elif key == "device_class":
-                            device_class = string_pool.intern(str(value)) if value else None
+                            device_class = string_pool.intern(str(value)[:50]) if value else None
                         elif key == "icon":
-                            icon = str(value) if value else None
+                            icon = str(value)[:100] if value else None
                         elif key == "latitude":
                             lat = value
                         elif key == "longitude":
-                            lon = value  
+                            lon = value
                         elif key == "options":
                             options = value
                         else:
-                            # Keep other attributes for JSONB storage
-                            attrs_dict[key] = value
+                            # Store other attributes (limit size to save memory)
+                            if len(str(value)) < 1000:  # Skip very large attributes
+                                attrs_dict[key] = value
                 
                 # Generate friendly name if missing
                 if not friendly_name:
@@ -420,25 +505,26 @@ def make_ltss_model(table_name: str = "ltss_turbo"):
                         friendly_name = entity_id.split(".", 1)[1].replace("_", " ").title()
                     else:
                         friendly_name = entity_id
-                    friendly_name = string_pool.intern(friendly_name)
+                    friendly_name = string_pool.intern(friendly_name[:255])
                 
-                # Optimized numeric state parsing with caching
+                # Optimized numeric state parsing with LRU cache
                 state_numeric = state_parser.parse_numeric_state(
                     state_str, device_class, domain, entity_id, options
                 )
                 
-                # Location processing - depends on PostGIS availability
+                # Location processing (optional)
                 location = None
                 if lat is not None and lon is not None:
                     try:
                         lat_f, lon_f = float(lat), float(lon)
                         # Validate coordinate ranges
                         if -90 <= lat_f <= 90 and -180 <= lon_f <= 180:
+                            # Round to 6 decimal places (11cm precision)
+                            lat_f = round(lat_f, 6)
+                            lon_f = round(lon_f, 6)
                             location = f"SRID=4326;POINT({lon_f} {lat_f})"
-                        else:
-                            _LOGGER.debug(f"Invalid coordinates for {entity_id}: lat={lat_f}, lon={lon_f}")
                     except (ValueError, TypeError):
-                        _LOGGER.debug(f"Could not parse coordinates for {entity_id}: lat={lat}, lon={lon}")
+                        pass  # Skip invalid coordinates
                 
                 return cls(
                     entity_id=entity_id,
@@ -459,7 +545,7 @@ def make_ltss_model(table_name: str = "ltss_turbo"):
                 )
                 
             except Exception as e:
-                _LOGGER.error(f"Optimized event conversion failed: {e}", exc_info=True)
+                _LOGGER.error(f"Event conversion failed for {entity_id}: {e}")
                 return None
         
         @classmethod
@@ -469,5 +555,12 @@ def make_ltss_model(table_name: str = "ltss_turbo"):
                 "state_parser": state_parser.get_cache_stats(),
                 "string_pool": string_pool.get_stats(),
             }
+        
+        @classmethod
+        def clear_caches(cls):
+            """Clear all caches to free memory."""
+            state_parser.clear_cache()
+            string_pool.clear()
+            _LOGGER.info("LTSS model caches cleared")
     
     return LTSS
